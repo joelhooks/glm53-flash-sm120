@@ -1,0 +1,20 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/csrc/libtorch_stable/cooperative_topk.cuh b/csrc/libtorch_stable/cooperative_topk.cuh
+index 34dec87ab..10a08b380 100644
+--- a/csrc/libtorch_stable/cooperative_topk.cuh
++++ b/csrc/libtorch_stable/cooperative_topk.cuh
+@@ -496,7 +496,7 @@ __device__ void large_topk(const float* __restrict__ row_input,
+ template <uint32_t TopK, uint32_t CS>
+ __device__ void cooperative_topk_body(CooperativeTopKParams<TopK> params) {
+   const auto rank = blockIdx.y, row = blockIdx.x, tx = threadIdx.x;
+-  const auto sl = params.lengths[row];
++  const int32_t sl = params.lengths[row] > 0 ? params.lengths[row] : 0;
+   int32_t* out = params.output + row * TopK;
+   const float* in = params.input + row * params.stride;
+ 

@@ -1,0 +1,27 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/transformers_utils/processors/__init__.py b/vllm/transformers_utils/processors/__init__.py
+index 4fa7d2fee..24fb65f01 100644
+--- a/vllm/transformers_utils/processors/__init__.py
++++ b/vllm/transformers_utils/processors/__init__.py
+@@ -20,6 +20,7 @@ __all__ = [
+     "FireRedLIDProcessor",
+     "FunASRProcessor",
+     "GLM4VProcessor",
++    "Glm5NextProcessor",
+     "Granite4VisionProcessor",
+     "H2OVLProcessor",
+     "Moondream3Processor",
+@@ -60,6 +61,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
+     "FireRedLIDProcessor": "vllm.transformers_utils.processors.fireredlid",
+     "FunASRProcessor": "vllm.transformers_utils.processors.funasr",
+     "GLM4VProcessor": "vllm.transformers_utils.processors.glm4v",
++    "Glm5NextProcessor": "vllm.transformers_utils.processors.glm5next",
+     "Granite4VisionProcessor": "vllm.transformers_utils.processors.granite4_vision",
+     "H2OVLProcessor": "vllm.transformers_utils.processors.h2ovl",
+     "InternVLProcessor": "vllm.transformers_utils.processors.internvl",

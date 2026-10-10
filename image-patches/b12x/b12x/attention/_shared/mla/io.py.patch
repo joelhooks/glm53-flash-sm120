@@ -1,0 +1,228 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/b12x/attention/_shared/mla/io.py b/b12x/attention/_shared/mla/io.py
+index 57af0e9..8ba52d1 100644
+--- a/b12x/attention/_shared/mla/io.py
++++ b/b12x/attention/_shared/mla/io.py
+@@ -82,11 +82,60 @@ _NVFP4_ROPE_SRC = 304
+ _NVFP4_FP8_ROPE_GMEM_STRIDE = 368
+ _NVFP4_FP8_ROPE_TAIL_BYTES = 80
+ _NVFP4_FP8_ROPE_TAIL_SRC = 288
++# GLM_NOPE (GLM-5.3-Flash, qk_rope_head_dim == 0). The record is the STRICT
++# [0, 288) prefix of the NVFP4 record above -- 256B packed E2M1 latent + 32B
++# E4M3 group-16 scales -- optionally followed by the fp32 per-token latent
++# scale at [288, 292) and 12B of 16B-alignment pad (304B stride):
++#
++#     [  0, 256)  packed E2M1 latent (512 x 4-bit, 32 group-16 blocks)
++#     [256, 288)  32 x E4M3 group scale bytes
++#     [288, 292)  fp32 per-token latent scale   } latent_scale_per_token
++#     [292, 304)  zero pad (16B align)          } only
++#
++# There is NO RoPE sub-record, so (a) the per-token record stride is 288/304 --
++# NOT the 432 of the rope-bearing NVFP4 record -- and (b) the generic NVFP4
++# arm's SECOND cp.async.bulk (the rope tail) must not be issued at all.
++_NVFP4_NO_ROPE_GMEM_STRIDE = 288
++_NVFP4_NO_ROPE_PTS_GMEM_STRIDE = 304
++# 8B-aligned source of the fp32 per-token latent scale word pair. Both NVFP4
++# two-level records put it at +288: the 368B fp8-rope record keeps the SECOND
++# word ([292,296); [288,292) is its rope scale), the 304B NoPE record keeps the
++# FIRST word ([288,292); [292,296) is pad).
++_NVFP4_LATENT_SCALE_SRC = 288
+ 
+ # IO warp width (one warp = 32 threads; FlashInfer DSV4_IO_THREADS).
+ _IO_THREADS = 32
+ 
+ 
++def _nvfp4_no_rope_gmem_stride(
++    kv_gmem_stride: int, per_token_latent_scale: bool
++) -> int:
++    """Resolve the GLM_NOPE per-token record stride at TRACE time (pure Python).
++
++    ``kv_gmem_stride`` (0 == unspecified) lets a caller thread
++    ``traits.kv_gmem_stride`` straight through and is then AUTHORITATIVE. When
++    it is omitted the stride follows ``latent_scale_per_token`` exactly the way
++    ``make_unified_traits`` derives it (288 without the per-token fp32 latent
++    scale, 304 with it), so the device geometry can never drift from the trait
++    that sized the cache.
++    """
++    if kv_gmem_stride:
++        if int(kv_gmem_stride) not in (
++            _NVFP4_NO_ROPE_GMEM_STRIDE,
++            _NVFP4_NO_ROPE_PTS_GMEM_STRIDE,
++        ):
++            raise ValueError(
++                "GLM_NOPE kv_gmem_stride must be 288 or 304 (the rope-less "
++                f"NVFP4 record); got {int(kv_gmem_stride)}"
++            )
++        return int(kv_gmem_stride)
++    return (
++        _NVFP4_NO_ROPE_PTS_GMEM_STRIDE
++        if per_token_latent_scale
++        else _NVFP4_NO_ROPE_GMEM_STRIDE
++    )
++
++
+ @cute.jit
+ def io_issue_gather(
+     kv_cache_u8: cute.Tensor,  # flat 1-D u8 view of the paged DSV4 KV cache
+@@ -104,7 +153,7 @@ def io_issue_gather(
+     *,
+     bi: cutlass.Constexpr,  # 64
+     kv_smem_stride: cutlass.Constexpr,  # 464 DSV4 / 528 GLM (smem nope row stride)
+-    rope_smem_stride: cutlass.Constexpr,  # 64 (D_ROPE bf16 elems)
++    rope_smem_stride: cutlass.Constexpr,  # 64 (D_ROPE bf16 elems); 0 == GLM_NOPE
+     scale_bytes_per_token: cutlass.Constexpr,  # 8 (DSV4 footer); unused for GLM
+     bulk_tx_bytes: cutlass.Constexpr,  # BI*(448+128)=36864 DSV4 / BI*(528+128)=41984 GLM
+     scale_format: cutlass.Constexpr = 0,  # UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
+@@ -115,6 +164,8 @@ def io_issue_gather(
+     split_mbar_arrival: cutlass.Constexpr = False,
+     overlap_footer_gather: cutlass.Constexpr = False,
+     per_token_latent_scale: cutlass.Constexpr = False,
++    no_rope: cutlass.Constexpr = False,  # GLM_NOPE: qk_rope_head_dim == 0
++    kv_gmem_stride: cutlass.Constexpr = 0,  # 0 == derive; else traits.kv_gmem_stride
+ ):
+     """Producer body for ONE chunk into buffer ``buf`` (caller selects the dst
+     addrs + full_mbar_ptr for ``buf``). Mirrors FlashInfer ``issue_gather``:
+@@ -136,6 +187,10 @@ def io_issue_gather(
+       3. IO leader (io_lane 0) arrive + expect_tx(BULK_TX_BYTES) on full[buf].
+       4. cp.async.bulk each entry; DSV4 issues separate NoPE (448B) and RoPE
+          (128B) copies, while packed GLM H8 issues one contiguous 656B copy.
++         GLM_NOPE (``rope_smem_stride == 0`` / ``no_rope``) issues ONLY the
++         288B latent copy -- its record has no rope tail and its ``kv_rope``
++         smem region is 0 bytes wide, so the second copy is const_expr-elided
++         rather than aimed at a zero-extent region.
+          Bulk completion decrements the full[buf] transaction count.
+ 
+     DUAL-CACHE (DSV4 only; FlashInfer ``issue_gather`` :243-306): this function
+@@ -156,9 +211,18 @@ def io_issue_gather(
+     _section_pbs = page_block_size
+     _section_stride = stride_kv_block
+ 
++    # GLM_NOPE specialization key (const_expr, resolved at TRACE time). The
++    # caller already threads ``traits.d_rope`` in as ``rope_smem_stride``, and
++    # d_rope == 0 is unique to the rope-less record (DSV4 and GLM_NSA are both
++    # 64), so it IS the key; ``no_rope`` lets a caller state the trait outright.
++    # Every rope-bearing model evaluates this to False, so their const_expr
++    # branches -- and their PTX -- are untouched.
++    _no_rope = bool(no_rope) or int(rope_smem_stride) == 0
++
+     # Per-model gmem geometry (const_expr). DSV4: 576B data + grouped 8B footer;
+     # GLM: 656B contiguous (528 nope+inline-scales + 128 rope), NO footer.
+     # NVFP4: 432B contiguous (288 nope+E4M3-scales+pad + 128 rope), NO footer.
++    # NVFP4 NoPE: 288B (304B with the per-token latent scale), NO rope tail.
+     if cutlass.const_expr(scale_format == 0):
+         _IOS = Int64(_DSV4_IO_STRIDE)  # 576 per-token data stride
+         _NOPE = Int32(_DSV4_NOPE_BYTES)  # 448 -> kv_fp8 (e4m3 nope)
+@@ -166,7 +230,18 @@ def io_issue_gather(
+         _ROPE_SRC = Int64(_DSV4_NOPE_BYTES)  # rope follows nope in the record
+     elif cutlass.const_expr(scale_format == 2):
+         _NOPE = Int32(_NVFP4_NOPE_SCALE_BYTES)
+-        if cutlass.const_expr(fp8_rope):
++        if cutlass.const_expr(_no_rope):
++            # GLM_NOPE: the whole record IS the 288B latent+scales prefix (304B
++            # when the per-token fp32 latent scale + 16B-align pad follow it).
++            # _ROPE / _ROPE_SRC are deliberately left UNDEFINED: the rope bulk
++            # below is const_expr-elided, and leaving the names unbound means a
++            # regression that resurrected it would fail LOUDLY at trace time
++            # (NameError) instead of writing 64 zero-extent copies over the
++            # live mbarrier array (kv_rope is a 0-byte region for NoPE).
++            _IOS = Int64(
++                _nvfp4_no_rope_gmem_stride(kv_gmem_stride, per_token_latent_scale)
++            )
++        elif cutlass.const_expr(fp8_rope):
+             _IOS = Int64(_NVFP4_FP8_ROPE_GMEM_STRIDE)
+             # Stage scale+pad+FP8 payload contiguously in the existing 128-byte
+             # BF16-rope smem row. decode_math interprets scale at +0 and E4M3 at +16.
+@@ -214,12 +289,15 @@ def io_issue_gather(
+                 _NOPE,
+                 full_mbar_u32,
+             )
+-            cp_async_bulk_g2s_mbar(
+-                kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
+-                data_base_i64 + _ROPE_SRC,
+-                _ROPE,
+-                full_mbar_u32,
+-            )
++            # GLM_NOPE has no rope sub-record: the second copy is elided whole.
++            # bulk_tx_bytes (BI*288) then already matches the bytes that land.
++            if cutlass.const_expr(not _no_rope):
++                cp_async_bulk_g2s_mbar(
++                    kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
++                    data_base_i64 + _ROPE_SRC,
++                    _ROPE,
++                    full_mbar_u32,
++                )
+ 
+     def _issue_payload():
+         eo = Int32(0)
+@@ -262,12 +340,14 @@ def io_issue_gather(
+                         _NOPE,
+                         full_mbar_u32,
+                     )
+-                    cp_async_bulk_g2s_mbar(
+-                        kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
+-                        data_base_i64 + _ROPE_SRC,
+-                        _ROPE,
+-                        full_mbar_u32,
+-                    )
++                    # See _issue_payload_entry: NoPE elides the rope copy.
++                    if cutlass.const_expr(not _no_rope):
++                        cp_async_bulk_g2s_mbar(
++                            kv_rope_dst_addr + entry * Int32(rope_smem_stride * 2),
++                            data_base_i64 + _ROPE_SRC,
++                            _ROPE,
++                            full_mbar_u32,
++                        )
+             eo += Int32(io_threads)
+ 
+     # Native H16 can overlap the random scalar footer load with the much larger
+@@ -339,13 +419,18 @@ def io_issue_gather(
+                 s_byte = entry * _FOOT
+                 st_shared_u32(kv_sc_dst_addr + s_byte, f0)
+                 st_shared_u32(kv_sc_dst_addr + s_byte + Int32(4), f1)
+-            elif cutlass.const_expr(
+-                scale_format == 2 and fp8_rope and per_token_latent_scale
+-            ):
+-                # NVFP4 two-level record: the per-token fp32 latent scale sits
+-                # at [292, 296).  292 is not 8B-aligned, so load the 8-aligned
+-                # pair at [288, 296) (rope scale, latent scale) and keep the
+-                # second word -- same nc.v2 pattern as the DSV4 footer.
++            elif cutlass.const_expr(scale_format == 2 and per_token_latent_scale):
++                # NVFP4 two-level record: gather the per-token fp32 latent scale
++                # into the contiguous smem kv_sc buffer that smem.py allocates
++                # for latent_scale_per_token (BI x 4). BOTH two-level variants
++                # need it -- gating this on fp8_rope left GLM_NOPE's kv_sc
++                # UNINITIALIZED and the outer dequant scale garbage.
++                #
++                # The word pair at [288, 296) is 8B-aligned in both records, so
++                # one nc.v2.u32 covers both; only the kept word differs:
++                #   fp8-rope 368B: [288,292) rope scale, [292,296) latent -> f1
++                #   NoPE     304B: [288,292) latent,     [292,296) pad     -> f0
++                f0 = Uint32(0)
+                 f1 = Uint32(0)
+                 if idx_raw >= Int32(0):
+                     block_idx = idx_raw // _section_pbs
+@@ -353,12 +438,15 @@ def io_issue_gather(
+                     scale_base_off = (
+                         Int64(block_idx) * _section_stride
+                         + Int64(local_idx) * _IOS
+-                        + Int64(_NVFP4_FP8_ROPE_TAIL_SRC)
++                        + Int64(_NVFP4_LATENT_SCALE_SRC)
+                     )
+-                    _, f1 = ld_global_nc_v2_u32(
++                    f0, f1 = ld_global_nc_v2_u32(
+                         get_ptr_as_int64(_section_kv, scale_base_off)
+                     )
+-                st_shared_u32(kv_sc_dst_addr + entry * Int32(4), f1)
++                if cutlass.const_expr(fp8_rope):
++                    st_shared_u32(kv_sc_dst_addr + entry * Int32(4), f1)
++                else:
++                    st_shared_u32(kv_sc_dst_addr + entry * Int32(4), f0)
+         eo += Int32(io_threads)
+ 
+     # --- (2) CTA-scope fence: footer/index stores visible before release. ---

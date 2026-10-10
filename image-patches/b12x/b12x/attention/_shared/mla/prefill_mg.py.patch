@@ -1,0 +1,128 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/b12x/attention/_shared/mla/prefill_mg.py b/b12x/attention/_shared/mla/prefill_mg.py
+index 5e67b86..742fbb0 100644
+--- a/b12x/attention/_shared/mla/prefill_mg.py
++++ b/b12x/attention/_shared/mla/prefill_mg.py
+@@ -2346,13 +2346,15 @@ class UnifiedPrefillMGKernel:
+         # W XV, V==nope (no XV-rope), 656/528 KV geometry, KV-rope from global/L2,
+         # Q-rope registerized (aliased onto W_FP8). DSV4 is the scale_format==0 /
+         # has_extra arm and is byte-identical.
+-        is_glm = cutlass.const_expr(t.model_type == ModelType.GLM_NSA)
++        is_glm = cutlass.const_expr(
++            t.model_type in (ModelType.GLM_NSA, ModelType.GLM_NOPE)
++        )
+         # NVFP4 (E2M1 + E4M3 group-16) GLM-family arm: BF16-QK with native
+         # in-register dequant, BF16 P.V staged in the dead W_FP8 region, and
+         # the 432B/288B record geometry. is_glm stays true for NVFP4 so the
+         # shared GLM staging (io gather / kv_sc absence / q_rope alias) applies.
+         is_nvfp4 = cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3)
+-        q_head_dim = cutlass.const_expr(_GLM_HEAD_DIM if is_glm else _DSV4_HEAD_DIM)
++        q_head_dim = cutlass.const_expr(t.d_nope + t.d_rope)
+         # Compile-time head-group count: 1 (heads==16) or 2 (heads % 32 == 0). All
+         # group-1 work below const_expr-elides when n_hg==1 (single-group MG).
+         n_hg = cutlass.const_expr(self.mg_n_hg)
+@@ -2541,6 +2543,8 @@ class UnifiedPrefillMGKernel:
+                         fp8_rope=t.fp8_rope,
+                         per_token_latent_scale=t.latent_scale_per_token,
+                         kv_sc_dst_addr=kv_sc_addr,
++                        d_rope=t.d_rope,
++                        kv_gmem_stride=t.kv_gmem_stride,
+                     )
+                 else:
+                     io_issue_gather_dsv4_nope(
+@@ -2641,6 +2645,8 @@ class UnifiedPrefillMGKernel:
+                                 fp8_rope=t.fp8_rope,
+                                 per_token_latent_scale=t.latent_scale_per_token,
+                                 kv_sc_dst_addr=kv_sc_addr + buf * kv_sc_buf,
++                                d_rope=t.d_rope,
++                                kv_gmem_stride=t.kv_gmem_stride,
+                             )
+                         else:
+                             io_issue_gather_dsv4_nope(
+@@ -4105,7 +4111,9 @@ def run_unified_prefill_mg(
+     head_offset: int = 0,
+ ):
+     model_type = int(model_type)
+-    is_glm = model_type == ModelType.GLM_NSA
++    is_glm_nsa = model_type == ModelType.GLM_NSA
++    is_glm_nope = model_type == ModelType.GLM_NOPE
++    is_glm = is_glm_nsa or is_glm_nope
+     # DSV4 dual-cache (has_extra) union. all-or-none + DSV4-only (GLM has no extra
+     # section). Forced BF16-QK by the caller (FI ships dual-cache as BF16 only).
+     has_extra = extra_kv_cache is not None
+@@ -4121,9 +4129,14 @@ def run_unified_prefill_mg(
+                 "(q_head_dim==512); GLM/DSV3.2 has no extra cache"
+             )
+     if scale_format is None:
+-        scale_format = ScaleFormat.ARBITRARY_FP32 if is_glm else ScaleFormat.UE8M0_BYTE
++        if is_glm_nope:
++            scale_format = ScaleFormat.NVFP4_E4M3
++        elif is_glm_nsa:
++            scale_format = ScaleFormat.ARBITRARY_FP32
++        else:
++            scale_format = ScaleFormat.UE8M0_BYTE
+     scale_format = int(scale_format)
+-    expected_qdim = _GLM_HEAD_DIM if is_glm else _DSV4_HEAD_DIM
++    expected_qdim = _GLM_HEAD_DIM if is_glm_nsa else _DSV4_HEAD_DIM
+     if int(q.shape[-1]) != expected_qdim:
+         raise ValueError(
+             f"SM120 sparse MLA MG prefill ({'GLM' if is_glm else 'DSV4'}) expects "
+@@ -4150,19 +4163,32 @@ def run_unified_prefill_mg(
+         )
+     if scale_format == ScaleFormat.NVFP4_E4M3:
+         record_bytes = int(kv_cache.shape[-1])
+-        if fp8_rope is None:
+-            if record_bytes not in (368, 432):
++        if is_glm_nope:
++            if fp8_rope:
+                 raise ValueError(
+-                    "NVFP4 sparse MLA MG cache record must be 368 or 432 bytes, "
+-                    f"got {record_bytes}"
++                    "GLM_NOPE NVFP4 sparse MLA MG has no RoPE sub-record"
++                )
++            expected_record_bytes = 304 if latent_scale_per_token else 288
++            if record_bytes != expected_record_bytes:
++                raise ValueError(
++                    "GLM_NOPE NVFP4 sparse MLA MG cache record must be "
++                    f"{expected_record_bytes} bytes, got {record_bytes}"
++                )
++            fp8_rope = False
++        else:
++            if fp8_rope is None:
++                if record_bytes not in (368, 432):
++                    raise ValueError(
++                        "NVFP4 sparse MLA MG cache record must be 368 or 432 "
++                        f"bytes, got {record_bytes}"
++                    )
++                fp8_rope = record_bytes == 368
++            expected_record_bytes = 368 if fp8_rope else 432
++            if record_bytes != expected_record_bytes:
++                raise ValueError(
++                    "NVFP4 sparse MLA MG cache record disagrees with fp8_rope: "
++                    f"got {record_bytes} bytes, expected {expected_record_bytes}"
+                 )
+-            fp8_rope = record_bytes == 368
+-        expected_record_bytes = 368 if fp8_rope else 432
+-        if record_bytes != expected_record_bytes:
+-            raise ValueError(
+-                "NVFP4 sparse MLA MG cache record disagrees with fp8_rope: "
+-                f"got {record_bytes} bytes, expected {expected_record_bytes}"
+-            )
+     # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
+     # the NVFP4 fp8-rope 368-byte record ONLY.
+     if latent_scale_per_token:
+@@ -4171,7 +4197,7 @@ def run_unified_prefill_mg(
+                 "SM120 sparse MLA MG prefill latent_scale_per_token requires "
+                 f"ScaleFormat.NVFP4_E4M3; got scale_format={int(scale_format)}"
+             )
+-        if not bool(fp8_rope):
++        if not bool(fp8_rope) and not is_glm_nope:
+             raise ValueError(
+                 "SM120 sparse MLA MG prefill latent_scale_per_token requires "
+                 "the fp8-rope 368-byte NVFP4 record; got the 432-byte record"

@@ -1,0 +1,64 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/v1/worker/test_gpu_thinking_budget.py b/tests/v1/worker/test_gpu_thinking_budget.py
+index 0b0f19f7d..2bc697b08 100644
+--- a/tests/v1/worker/test_gpu_thinking_budget.py
++++ b/tests/v1/worker/test_gpu_thinking_budget.py
+@@ -12,6 +12,7 @@ if not torch.cuda.is_available():
+     )
+ 
+ from vllm.sampling_params import SamplingParams
++from vllm.v1.worker.gpu.sample.sampler import Sampler
+ from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
+ from vllm.v1.worker.gpu.states import RequestState
+ 
+@@ -185,6 +186,44 @@ def test_v2_thinking_budget_ignores_plain_request():
+     assert torch.all(out == 0)
+ 
+ 
++def test_v2_greedy_sampling_applies_thinking_budget():
++    """Greedy-only requests must not bypass thinking-budget processing."""
++    req_states = _make_req_states([1, START, 10, 11, 12], prompt_len=1)
++    sampler = Sampler(
++        max_num_reqs=4,
++        vocab_size=VOCAB_SIZE,
++        device=DEVICE,
++        req_states=req_states,
++        reasoning_config=MockReasoningConfig(),
++    )
++    sampler.add_request(
++        req_idx=3,
++        prompt_len=1,
++        sampling_params=SamplingParams(
++            temperature=0.0,
++            thinking_token_budget=3,
++        ),
++    )
++    sampler.apply_staged_writes()
++
++    idx_mapping = torch.tensor([3], dtype=torch.int32, device=DEVICE)
++    idx_mapping_np = idx_mapping.cpu().numpy()
++    expanded_idx_mapping = idx_mapping.clone()
++    input_ids = torch.tensor([12], dtype=torch.int32, device=DEVICE)
++    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
++    out = sampler.apply_sampling_params(
++        logits,
++        expanded_idx_mapping,
++        idx_mapping,
++        idx_mapping_np,
++        torch.tensor([4], dtype=torch.int32, device=DEVICE),
++        input_ids,
++        torch.tensor([0], dtype=torch.int32, device=DEVICE),
++    )
++
++    assert out[0, END].item() == pytest.approx(1.0e9)
++
++
+ def test_v2_thinking_budget_latest_prefill_end_disables_forcing():
+     req_states = _make_req_states(
+         [1, START, 10, 11, 12, END, 13],

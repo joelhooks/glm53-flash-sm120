@@ -1,0 +1,43 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/docs/features/quantization/online.md b/docs/features/quantization/online.md
+index a32b16f47..e818a81c8 100644
+--- a/docs/features/quantization/online.md
++++ b/docs/features/quantization/online.md
+@@ -115,7 +115,7 @@ vllm serve <glm-5.2-modelopt-checkpoint> \
+ Serialized checkpoint-quantized shared experts are preserved; only excluded
+ BF16 projection weights are converted at load time.
+ 
+-### MXFP8 dense linears on ModelOpt checkpoints
++### MXFP8 dense linears on quantized checkpoints
+ 
+ The `linear` field overlays online MXFP8 the same way onto every other
+ BF16 dense linear the ModelOpt checkpoint excludes: attention projections,
+@@ -158,6 +158,22 @@ vllm serve lukealonso/GLM-5.2-NVFP4 \
+   --quantization-config '{"linear":{"weight":"mxfp8"},"ignore":["re:.*kv_b_proj"]}'
+ ```
+ 
++EXL3 checkpoints can use the same overlay for dense and shared-expert
++projections that are absent from the EXL3 tensor metadata. Serialized EXL3
++dense matrices and routed experts always retain their checkpoint format;
++`moe` overlays are rejected. `lm_head` also remains in its checkpoint format
++or BF16. For example:
++
++```bash
++vllm serve <exl3-checkpoint> \
++  --quantization exl3 \
++  --quantization-config '{"linear":{"weight":"mxfp8"},"shared_experts":{"weight":"mxfp8"},"ignore":["re:.*\\.q_a_proj$","re:.*kv_a_proj_with_mqa","lm_head"]}'
++```
++
++As with ModelOpt, `linear` does not select shared experts. Add the
++`shared_experts` field explicitly when those BF16 projections should also be
++converted. Ignore patterns are matched against unfused checkpoint names.
++
+ ### Activation overrides on already-quantized checkpoints
+ 
+ For checkpoint-quantized models, `quantization_config` lets you pick an

@@ -1,0 +1,48 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+index dd94ffb2f..27fa00ada 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+@@ -54,6 +54,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, get_kv_cache_layout
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
++    KpoolTailSpec,
+     KVCacheSpec,
+     MambaSpec,
+     MLAAttentionSpec,
+@@ -1675,8 +1676,12 @@ class MooncakeConnectorWorker:
+                 )
+                 continue
+             if isinstance(layer_spec, MambaSpec):
+-                conv, _ = cache_or_caches
+-                cache_list = [conv]
++                # Mamba conv+ssm state is packed into a single page-view
++                # tensor [num_blocks, 1, 1, page_size_bytes] (conv at offset 0,
++                # recurrent state after). Register the whole page so the full
++                # state transfers per block; the decode side recomputes the
++                # last token on top of it.
++                cache_list = [cache_or_caches]
+             else:
+                 # K and V are packed into one blocks-first tensor per layer,
+                 # so each layer registers as a single region.
+@@ -1694,7 +1699,12 @@ class MooncakeConnectorWorker:
+                 block_len = cache.stride(0) * cache.element_size()
+                 region_base_addresses.append(base_addr)
+ 
+-                if isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
++                if isinstance(layer_spec, KpoolTailSpec):
++                    # The tail is a strided view of the padded indexer tensor,
++                    # so block addresses retain the physical stride. Only the
++                    # transferred K/score half uses the unpadded page length.
++                    kv_block_len = layer_spec.unpadded_page_size_bytes // 2
++                elif isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
+                     kv_block_len = layer_spec.page_size_bytes
+                 elif self.transfer_topo.virtually_split_kv_in_blocks and not isinstance(
+                     layer_spec, MambaSpec

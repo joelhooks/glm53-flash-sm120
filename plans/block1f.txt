@@ -1,0 +1,6 @@
+# Block 1f: probe 3b (per-sub-block syncs in decoder layers and inside KDA, mixed steps), then control and rate.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+probe probe 2 5 8
+probe probe 2 6 8
+source baseline 1 1 4
+source baseline 2 2 8

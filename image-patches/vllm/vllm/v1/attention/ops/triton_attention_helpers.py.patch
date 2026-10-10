@@ -1,0 +1,75 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/attention/ops/triton_attention_helpers.py b/vllm/v1/attention/ops/triton_attention_helpers.py
+index b2667935c..bf207941e 100644
+--- a/vllm/v1/attention/ops/triton_attention_helpers.py
++++ b/vllm/v1/attention/ops/triton_attention_helpers.py
+@@ -169,7 +169,8 @@ def compute_tile_loop_bounds(
+        sequence.
+     2. Sliding-window pruning: narrows ``[tile_start, tile_end)`` to
+        only tiles that can contain an allowed key under SWA.
+-       For non-causal sequences, the window extends in both directions.
++       Non-causal sequences still bound old context by the window but
++       may attend to keys to the right within the current sequence.
+     3. 3D scoping: when ``IS_3D`` is True, further narrows to the
+        segment's slice via ``(segm_idx * tiles_per_segment,
+        (segm_idx + 1) * tiles_per_segment)``.
+@@ -217,11 +218,9 @@ def compute_tile_loop_bounds(
+         else:
+             first_allowed_key = q_abs - SLIDING_WINDOW + 1
+         if USE_PER_SEQ_CAUSAL or (not USE_CAUSAL):
+-            # Non-causal: keys can be AHEAD of query within the window
+-            last_allowed_key = tl.minimum(
+-                context_len + qpos_hi + SLIDING_WINDOW - 1,
+-                seq_len - 1,
+-            )
++            # Non-causal DFlash attention can see the complete draft block to
++            # the right. The element mask below still bounds old context.
++            last_allowed_key = seq_len - 1
+         else:
+             last_allowed_key = context_len + qpos_hi
+         # Convert to tile indices and clamp
+@@ -272,8 +271,8 @@ def store_segm_reduce_scalars(
+ def compute_kv_seq_mask(
+     query_abs_pos,
+     seq_offset,
+-    seq_idx,
+     seq_len,
++    seq_idx,
+     mm_prefix_range_ptr,
+     SLIDING_WINDOW: tl.constexpr,
+     USE_MM_PREFIX: tl.constexpr,
+@@ -320,21 +319,18 @@ def compute_kv_seq_mask(
+     # BEFORE mm_prefix OR.
+     # Order must match FlexAttention:
+     #   (causal AND sliding_window) OR mm_prefix
+-    if CHUNK_LOOKBACK > -1:
++    if USE_CAUSAL and CHUNK_LOOKBACK > -1:
+         seq_mask = seq_mask & (
+             (query_abs_pos // CHUNK_SIZE - seq_offset[None, :] // CHUNK_SIZE)
+             <= CHUNK_LOOKBACK
+         )
+     elif SLIDING_WINDOW > 0 and not USE_R_SWA:
+-        sw_left = (query_abs_pos - seq_offset) < SLIDING_WINDOW
+-        if USE_PER_SEQ_CAUSAL:
+-            sw_right = (seq_offset[None, :] - query_abs_pos) < SLIDING_WINDOW
+-            seq_mask = seq_mask & tl.where(is_causal, sw_left, sw_left & sw_right)
+-        elif not USE_CAUSAL:
+-            sw_right = (seq_offset[None, :] - query_abs_pos) < SLIDING_WINDOW
+-            seq_mask = seq_mask & sw_left & sw_right
+-        else:
+-            seq_mask = seq_mask & sw_left
++        # The window is a backward-context bound. In non-causal DFlash mode,
++        # future keys in the current draft block have negative distance and
++        # therefore remain visible, matching the reference implementation.
++        seq_mask = seq_mask & (
++            (query_abs_pos - seq_offset) < SLIDING_WINDOW
++        )
+ 
+     if USE_R_SWA:
+         prefix_len = tl.load(rswa_prefix_lens_ptr + seq_idx)

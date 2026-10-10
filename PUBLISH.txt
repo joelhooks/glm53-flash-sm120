@@ -1,0 +1,25 @@
+# Paths (relative to this directory) that form the public repository.
+# Everything else here is lab-only. redaction-scan.sh scans exactly this list.
+README.md
+LICENSE
+PUBLISH.txt
+redaction-scan.sh
+redaction-allow.txt
+Dockerfile
+build-source.sh
+extract-source.sh
+fetch-source.sh
+split-patches.py
+repro-client.py
+make-compose.py
+compose-base.json
+run-repro.sh
+run-block.sh
+bench-lib.sh
+plans/
+image-patches/
+upstream/
+attribute-patches.py
+export-public.sh
+licenses/
+probes/

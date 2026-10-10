@@ -1,0 +1,47 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/quantization/test_quantization_config_args.py b/tests/quantization/test_quantization_config_args.py
+index 1fb3be478..ce8a1e4fb 100644
+--- a/tests/quantization/test_quantization_config_args.py
++++ b/tests/quantization/test_quantization_config_args.py
+@@ -189,6 +189,35 @@ def test_resolve_rejects_modelopt_moe_override():
+         )
+ 
+ 
++def test_resolve_allows_exl3_bf16_mxfp8_overlay():
++    args = resolve_quantization_config(
++        "exl3",
++        {
++            "linear": {"weight": "mxfp8"},
++            "shared_experts": "mxfp8",
++            "ignore": ["re:.*q_a_proj$", "lm_head"],
++        },
++    )
++
++    assert args.linear == QuantSpec(weight=kMxfp8Dynamic)
++    assert args.shared_experts == QuantSpec(weight=kMxfp8Dynamic)
++    assert args.ignore == ["re:.*q_a_proj$", "lm_head"]
++
++
++@pytest.mark.parametrize(
++    "config",
++    [
++        {"linear": {"weight": "fp8_per_block_static"}},
++        {"linear": {"weight": "mxfp8", "activation": "mxfp8"}},
++        {"linear": {"weight": "mxfp8"}, "moe": "mxfp8"},
++        {"shared_experts": "mxfp8", "ignore": ["lm_head"]},
++    ],
++)
++def test_resolve_rejects_unsupported_exl3_overlay(config):
++    with pytest.raises(ValueError, match="checkpoint online overlay"):
++        resolve_quantization_config("exl3", config)
++
++
+ def test_resolve_rejects_quantization_config_with_non_shorthand_quant():
+     # If --quantization names something other than an online shorthand,
+     # quantization_config is not allowed via this path (checkpoint quant

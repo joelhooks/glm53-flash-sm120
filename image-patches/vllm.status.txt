@@ -1,0 +1,166 @@
+M  csrc/fs_io.cpp
+M  csrc/libtorch_stable/cooperative_topk.cuh
+M  csrc/libtorch_stable/persistent_topk.cuh
+M  docs/features/quantization/online.md
+M  serve-ds4-flash.sh
+M  tests/config/test_speculative_draft_hf_overrides.py
+A  tests/config/test_speculative_dspark.py
+M  tests/distributed/test_b12x_fused_all_reduce.py
+M  tests/distributed/test_dcp_direct_a2a_lse_reduce.py
+M  tests/entrypoints/test_ds4_allreduce_launcher.py
+M  tests/entrypoints/test_ds4_flash_launcher.py
+M  tests/kernels/attention/test_flashmla_sparse.py
+M  tests/kernels/test_top_k_per_row.py
+M  tests/model_executor/layers/test_mla_short_prefill_indexer.py
+M  tests/model_executor/layers/test_sparse_attn_indexer_b12x.py
+M  tests/models/deepseek_v4/test_b12x_mhc_expected_m.py
+M  tests/models/deepseek_v4/test_cache_utils.py
+A  tests/models/deepseek_v4/test_indexer_graph_capture.py
+M  tests/models/test_deepseek_mtp_mxfp8_loader.py
+A  tests/models/test_deepseek_v2_mtp_weights.py
+M  tests/parser/engine/test_deepseek_v4.py
+A  tests/parser/engine/test_deepseek_v4_legacy_dsml.py
+M  tests/quantization/test_exl3.py
+A  tests/quantization/test_exl3_online_cache.py
+M  tests/quantization/test_exl3_prefill_plan.py
+A  tests/quantization/test_exl3_warmup.py
+M  tests/quantization/test_quantization_config_args.py
+A  tests/test_b12x_package_contract.py
+M  tests/test_config.py
+M  tests/tool_parsers/test_structural_tag_registry.py
+M  tests/transformers_utils/test_repo_utils.py
+M  tests/v1/attention/test_b12x_ckv_prefetch_policy.py
+M  tests/v1/attention/test_b12x_mla_dcp_workspace.py
+M  tests/v1/attention/test_deepseek_v4_sparse_mla_metadata.py
+M  tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py
+M  tests/v1/attention/test_mla_backends.py
+M  tests/v1/core/test_async_scheduler.py
+M  tests/v1/core/test_scheduler.py
+M  tests/v1/core/test_single_type_kv_cache_manager.py
+M  tests/v1/kv_connector/unit/test_invalid_blocks_correctness.py
+M  tests/v1/kv_connector/unit/utils.py
+M  tests/v1/kv_offload/tiering/test_fs_tier.py
+A  tests/v1/spec_decode/test_dspark_cudagraph_contract.py
+M  tests/v1/spec_decode/test_dynamic_sd_cug.py
+M  tests/v1/spec_decode/test_mtp_structured_output.py
+A  tests/v1/structured_output/test_backend_xgrammar_validation.py
+M  tests/v1/structured_output/test_utils.py
+M  tests/v1/worker/test_gpu_batch_ordering.py
+M  tests/v1/worker/test_gpu_input_batch_v2.py
+M  tests/v1/worker/test_gpu_model_runner.py
+A  tests/v1/worker/test_gpu_sampler_flags.py
+A  tests/v1/worker/test_gpu_structured_outputs.py
+M  tests/v1/worker/test_gpu_thinking_budget.py
+M  tests/v1/worker/test_gpu_worker.py
+M  tests/v1/worker/test_kv_block_zeroer.py
+M  tests/v1/worker/test_prompt_logprobs.py
+ M vllm/compilation/passes/fusion/allreduce_rms_fusion.py
+ M vllm/config/compilation.py
+M  vllm/config/quantization.py
+MM vllm/config/speculative.py
+MM vllm/config/vllm.py
+M  vllm/distributed/device_communicators/custom_all_reduce.py
+ M vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+ M vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+ M vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+ M vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+M  vllm/envs.py
+ M vllm/model_executor/kernels/mhc/tilelang_kernels.py
+MM vllm/model_executor/layers/attention/mla_attention.py
+ M vllm/model_executor/layers/fused_moe/experts/trtllm_fp8_moe.py
+ M vllm/model_executor/layers/logits_processor.py
+ M vllm/model_executor/layers/mhc.py
+ M vllm/model_executor/layers/mla.py
+ M vllm/model_executor/layers/mla_cache_format.py
+MM vllm/model_executor/layers/quantization/exl3.py
+A  vllm/model_executor/layers/quantization/exl3_online_cache.py
+M  vllm/model_executor/layers/quantization/nvfp4_nf3_hybrid.py
+ M vllm/model_executor/layers/quantization/utils/flashinfer_utils.py
+ M vllm/model_executor/layers/rotary_embedding/common.py
+M  vllm/model_executor/model_loader/utils.py
+M  vllm/model_executor/models/deepseek_mtp.py
+M  vllm/model_executor/models/deepseek_v2.py
+ M vllm/model_executor/models/qwen3_dflash.py
+ M vllm/model_executor/models/registry.py
+M  vllm/model_executor/models/utils.py
+MM vllm/model_executor/warmup/kernel_warmup.py
+M  vllm/models/deepseek_v32/attention.py
+M  vllm/models/deepseek_v4/attention.py
+M  vllm/models/deepseek_v4/common/ops/cache_utils.py
+M  vllm/models/deepseek_v4/nvidia/model.py
+M  vllm/models/deepseek_v4/nvidia/mtp.py
+M  vllm/models/deepseek_v4/sparse_mla.py
+ M vllm/multimodal/image.py
+ M vllm/multimodal/video.py
+M  vllm/parser/abstract_parser.py
+M  vllm/parser/deepseek_v4.py
+M  vllm/parser/engine/parser_engine_config.py
+M  vllm/parser/engine/streaming_parser_engine.py
+ M vllm/platforms/cuda.py
+ M vllm/platforms/interface.py
+ M vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+ M vllm/third_party/flash_linear_attention/ops/kda.py
+ M vllm/transformers_utils/config.py
+ M vllm/transformers_utils/configs/__init__.py
+ M vllm/transformers_utils/model_arch_config_convertor.py
+ M vllm/transformers_utils/processors/__init__.py
+M  vllm/transformers_utils/repo_utils.py
+ M vllm/utils/deep_gemm.py
+ M vllm/utils/flashinfer.py
+ M vllm/utils/import_utils.py
+ M vllm/v1/attention/backends/flash_attn.py
+ M vllm/v1/attention/backends/gdn_attn.py
+MM vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+ M vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
+ M vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+MM vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+ M vllm/v1/attention/backends/mla/flashmla_sparse.py
+MM vllm/v1/attention/backends/mla/indexer.py
+ M vllm/v1/attention/backends/mla/sparse_utils.py
+ M vllm/v1/attention/backends/mla/triton_mla.py
+ M vllm/v1/attention/backends/registry.py
+MM vllm/v1/attention/ops/dcp_utils.py
+ M vllm/v1/attention/ops/int4_per_token_head.py
+ M vllm/v1/attention/ops/triton_attention_helpers.py
+ M vllm/v1/core/kv_cache_coordinator.py
+ M vllm/v1/core/kv_cache_utils.py
+M  vllm/v1/core/sched/output.py
+M  vllm/v1/core/sched/scheduler.py
+MM vllm/v1/core/single_type_kv_cache_manager.py
+ M vllm/v1/engine/core.py
+ M vllm/v1/kv_cache_interface.py
+M  vllm/v1/kv_offload/tiering/fs/io.py
+M  vllm/v1/kv_offload/tiering/fs/manager.py
+ M vllm/v1/spec_decode/llm_base_proposer.py
+M  vllm/v1/structured_output/__init__.py
+M  vllm/v1/structured_output/backend_xgrammar.py
+M  vllm/v1/structured_output/utils.py
+ M vllm/v1/worker/encoder_cudagraph.py
+ M vllm/v1/worker/gpu/attn_utils.py
+MM vllm/v1/worker/gpu/cudagraph_utils.py
+M  vllm/v1/worker/gpu/input_batch.py
+ M vllm/v1/worker/gpu/mm/encoder_runner.py
+MM vllm/v1/worker/gpu/model_runner.py
+ M vllm/v1/worker/gpu/model_states/interface.py
+ M vllm/v1/worker/gpu/sample/gumbel.py
+M  vllm/v1/worker/gpu/sample/sampler.py
+ M vllm/v1/worker/gpu/spec_decode/__init__.py
+M  vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+M  vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+ M vllm/v1/worker/gpu/spec_decode/speculator.py
+M  vllm/v1/worker/gpu/structured_outputs.py
+M  vllm/v1/worker/gpu/warmup.py
+MM vllm/v1/worker/gpu_model_runner.py
+M  vllm/v1/worker/gpu_worker.py
+MM vllm/v1/worker/utils.py
+ M vllm/v1/worker/worker_base.py
+ M vllm/vllm_flash_attn/flash_attn_interface.py
+?? vllm/model_executor/layers/mamba/ops/scatter_states.py
+?? vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+?? vllm/model_executor/models/qwen3_dflash2.py
+?? vllm/model_executor/warmup/spec_decode_rejection_warmup.py
+?? vllm/models/glm5next/
+?? vllm/transformers_utils/configs/glm5_next.py
+?? vllm/transformers_utils/processors/glm5next.py
+?? vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py
+?? vllm/v1/worker/gpu/spec_decode/dflash2/

@@ -1,0 +1,6 @@
+# Block 1e: probe 2 (layer-entry sync, token-index checks), then control and rate.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+probe probe 2 3 8
+probe probe 2 4 8
+source baseline 1 1 4
+source baseline 2 2 8

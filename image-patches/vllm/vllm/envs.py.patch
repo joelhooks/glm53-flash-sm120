@@ -1,0 +1,32 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 8bcd9d0bc..dc61c3b09 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -2449,8 +2449,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_EXL3_TRELLIS_MAX_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_MAX_M"),
+     "VLLM_EXL3_TRELLIS_BLOCK_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_BLOCK_M"),
+     "VLLM_EXL3_PREFILL_CHUNK": lambda: os.getenv("VLLM_EXL3_PREFILL_CHUNK"),
++    "VLLM_EXL3_PREFILL_CAPACITY": lambda: os.getenv("VLLM_EXL3_PREFILL_CAPACITY"),
+     "VLLM_EXL3_PREFILL_TRELLIS": lambda: os.getenv("VLLM_EXL3_PREFILL_TRELLIS"),
+     "VLLM_EXL3_PREFILL_BLOCK_M": lambda: os.getenv("VLLM_EXL3_PREFILL_BLOCK_M"),
++    "VLLM_EXL3_R7_A1_MIN_ROWS": lambda: os.getenv("VLLM_EXL3_R7_A1_MIN_ROWS"),
++    "VLLM_EXL3_R7_DEBUG": lambda: os.getenv("VLLM_EXL3_R7_DEBUG"),
++    "VLLM_EXL3_R7_FUSED": lambda: os.getenv("VLLM_EXL3_R7_FUSED"),
++    "VLLM_EXL3_R7_FUSED_LAYERS": lambda: os.getenv("VLLM_EXL3_R7_FUSED_LAYERS"),
++    "VLLM_EXL3_R7_ROUTE_BLOCK": lambda: os.getenv("VLLM_EXL3_R7_ROUTE_BLOCK"),
++    # Deterministic online EXL3 encoding and its persistent rank-local cache.
++    "VLLM_EXL3_ONLINE_TRELLIS_BITS": lambda: os.getenv("VLLM_EXL3_ONLINE_TRELLIS_BITS"),
++    "VLLM_EXL3_ENCODER_SOURCE": lambda: os.getenv("VLLM_EXL3_ENCODER_SOURCE"),
++    "VLLM_EXL3_ENCODER_REVISION": lambda: os.getenv("VLLM_EXL3_ENCODER_REVISION"),
++    "VLLM_EXL3_ONLINE_CACHE_DIR": lambda: os.getenv("VLLM_EXL3_ONLINE_CACHE_DIR"),
++    "VLLM_EXL3_ONLINE_CACHE_MODE": lambda: os.getenv("VLLM_EXL3_ONLINE_CACHE_MODE"),
+     # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
+     "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
+     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),

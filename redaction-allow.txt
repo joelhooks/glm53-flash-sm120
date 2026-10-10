@@ -1,0 +1,2 @@
+# Exact substrings of reviewed false positives, one per line.
+"com.nvidia.curand.version": "10.4.3.29"

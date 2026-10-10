@@ -1,0 +1,79 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index 58c59fcbb..d8a2a973b 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -70,10 +70,13 @@ def _retain_dflash_weight(weight: torch.Tensor) -> torch.Tensor:
+ 
+ 
+ def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
+-    """``dflash_config.causal`` overrides all layers; else only SWA layers causal."""
++    """Resolve explicit causality before falling back to legacy layer defaults."""
++    is_causal = getattr(config, "is_causal", None)
++    if is_causal is not None:
++        return bool(is_causal)
+     override = (getattr(config, "dflash_config", None) or {}).get("causal")
+     if override is not None:
+-        return override
++        return bool(override)
+     layer_types = getattr(config, "layer_types", None)
+     return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
+ 
+@@ -168,6 +171,15 @@ class DFlashAttention(Attention):
+     window-bounded so replicated DCP does not allocate a full-context draft KV.
+     """
+ 
++    def __init__(self, *args, **kwargs) -> None:
++        super().__init__(*args, **kwargs)
++        # FlashAttention normally inherits the target model's DCP execution
++        # mode from the global parallel config. DFlash, however, stores a
++        # complete replicated draft cache on every DCP rank, so it must run
++        # ordinary local attention instead of gathering queries and merging
++        # partial attention states across ranks.
++        self.dcp_replicated = True
++
+     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+         # The draft attends locally over a replicated cache. DCP ranks therefore
+         # need the same draft KV, but sliding-window layers must stay windowed
+@@ -395,6 +407,8 @@ class DFlashQwen3DecoderLayer(nn.Module):
+ 
+ @support_torch_compile
+ class DFlashQwen3Model(nn.Module):
++    decoder_layer_cls = DFlashQwen3DecoderLayer
++
+     hf_to_vllm_mapper = WeightsMapper(
+         orig_to_new_substr={"midlayer.": "layers.0."},
+         orig_to_new_stacked={
+@@ -454,7 +468,7 @@ class DFlashQwen3Model(nn.Module):
+         ]
+         self.layers = nn.ModuleList(
+             [
+-                DFlashQwen3DecoderLayer(
++                self.decoder_layer_cls(
+                     current_vllm_config,
+                     config=self.config,
+                     layer_idx=layer_idx,
+@@ -734,6 +748,8 @@ class DFlashQwen3Model(nn.Module):
+ 
+ 
+ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
++    model_cls = DFlashQwen3Model
++
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         nn.Module.__init__(self)
+         self.draft_model_config = vllm_config.speculative_config.draft_model_config
+@@ -743,7 +759,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+         target_layer_num = vllm_config.model_config.get_num_layers(
+             vllm_config.parallel_config
+         )
+-        self.model = DFlashQwen3Model(
++        self.model = self.model_cls(
+             vllm_config=vllm_config,
+             # Keep draft Attention layer names out of the target model's
+             # `model.layers.*` namespace. The Python module hierarchy remains

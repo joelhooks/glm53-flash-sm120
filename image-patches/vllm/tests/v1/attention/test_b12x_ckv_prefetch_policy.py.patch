@@ -1,0 +1,34 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/v1/attention/test_b12x_ckv_prefetch_policy.py b/tests/v1/attention/test_b12x_ckv_prefetch_policy.py
+index f48dd7bda..bc93f06e7 100644
+--- a/tests/v1/attention/test_b12x_ckv_prefetch_policy.py
++++ b/tests/v1/attention/test_b12x_ckv_prefetch_policy.py
+@@ -241,6 +241,22 @@ def test_ckv_prefetch_target_and_draft_lifecycles_are_isolated(monkeypatch):
+     assert draft_state.pending_layers == {}
+ 
+ 
++def test_ckv_prefetch_capture_and_runtime_builders_share_workspace_state():
++    pool = _CKVPrefetchWorkspacePool(torch.device("cpu"), 64, 2)
++    capture_registry = _CKVPrefetchStateRegistry(pool)
++    runtime_registry = _CKVPrefetchStateRegistry(pool)
++    workspace_buffer = torch.empty(16, dtype=torch.uint8)
++
++    capture_state = capture_registry.for_workspace(workspace_buffer)
++    capture_ring = capture_state.get_ckv_workspace(64)
++    runtime_state = runtime_registry.for_workspace(workspace_buffer)
++
++    assert runtime_state is capture_state
++    assert runtime_state.get_ckv_workspace(64) is capture_ring
++    assert capture_registry.states is runtime_registry.states
++    assert pool._leased_slots == {0}
++
++
+ def test_ckv_prefetch_lazily_owns_one_stream_per_workspace_lane(monkeypatch):
+     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)

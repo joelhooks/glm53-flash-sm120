@@ -1,0 +1,27 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/v1/worker/test_gpu_input_batch_v2.py b/tests/v1/worker/test_gpu_input_batch_v2.py
+index f517abb2b..2f4053448 100644
+--- a/tests/v1/worker/test_gpu_input_batch_v2.py
++++ b/tests/v1/worker/test_gpu_input_batch_v2.py
+@@ -51,3 +51,15 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
+     assert torch.equal(
+         batch.query_start_loc.cpu(), torch.from_numpy(batch.query_start_loc_np)
+     )
++
++
++def test_has_prefill_reflects_request_state():
++    """FULL decode graph eligibility must observe every scheduled request."""
++    buffers = InputBuffers(
++        max_num_reqs=2, max_num_tokens=16, device=torch.device(DEVICE)
++    )
++    batch = InputBatch.make_dummy(num_reqs=2, num_tokens=16, input_buffers=buffers)
++
++    assert not batch.has_prefill
++    batch.is_prefilling_np[1] = True
++    assert batch.has_prefill

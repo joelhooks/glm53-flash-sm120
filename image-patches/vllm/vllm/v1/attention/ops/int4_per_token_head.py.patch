@@ -1,0 +1,21 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/attention/ops/int4_per_token_head.py b/vllm/v1/attention/ops/int4_per_token_head.py
+index 322d32bb8..5ea5798c2 100644
+--- a/vllm/v1/attention/ops/int4_per_token_head.py
++++ b/vllm/v1/attention/ops/int4_per_token_head.py
+@@ -556,8 +556,8 @@ def _attn_packed(
+         seq_mask = compute_kv_seq_mask(
+             query_abs_pos,
+             seq_offset,
+-            seq_idx,
+             seq_len,
++            seq_idx,
+             mm_prefix_range_ptr,
+             SLIDING_WINDOW,
+             USE_MM_PREFIX,

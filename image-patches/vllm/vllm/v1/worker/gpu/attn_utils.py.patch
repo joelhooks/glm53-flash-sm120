@@ -1,0 +1,37 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index 7265cfc42..61f11aada 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -37,6 +37,7 @@ from vllm.v1.worker.utils import (
+     AttentionGroup,
+     add_kv_sharing_layers_to_kv_cache_groups,
+     bind_kv_cache,
++    compressed_kernel_block_size,
+     prepare_kernel_block_sizes,
+ )
+ 
+@@ -306,10 +307,13 @@ def _reshape_kv_cache(
+             continue
+ 
+         kv_cache_spec = group.kv_cache_spec
+-        if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
+-            # use storage_block_size as the kernel block size for groups
+-            # that apply a compression on block size (eg. DeepSeek V4).
+-            kernel_block_size = kv_cache_spec.storage_block_size
++        if (
++            isinstance(kv_cache_spec, AttentionSpec)
++            and kv_cache_spec.storage_block_size != kv_cache_spec.block_size
++        ):
++            # Use the compressed cache's storage block or virtual pool page as
++            # its kernel page.
++            kernel_block_size = compressed_kernel_block_size(kv_cache_spec)
+         else:
+             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+ 

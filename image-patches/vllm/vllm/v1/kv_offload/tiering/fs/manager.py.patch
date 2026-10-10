@@ -1,0 +1,22 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/kv_offload/tiering/fs/manager.py b/vllm/v1/kv_offload/tiering/fs/manager.py
+index 2c7527f99..7c18080d4 100644
+--- a/vllm/v1/kv_offload/tiering/fs/manager.py
++++ b/vllm/v1/kv_offload/tiering/fs/manager.py
+@@ -4,8 +4,8 @@
+ FileSystemTierManager: Pure-Python file system secondary tier for KV cache offloading.
+ 
+ Store path:
+-    Data is written to a temp file (<dest_path.tmp>) via os.write,
+-    then os.replace'd to the final path (without .tmp).
++    Data is written to a private temp file via os.write, then atomically linked
++    to the final content-addressed path only if that path is absent.
+ 
+ Load path:
+     Data is read from the block file directly via os.readv into the

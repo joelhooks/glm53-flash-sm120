@@ -1,0 +1,31 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (files untracked in the image)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/models/glm5next/__init__.py b/vllm/models/glm5next/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f30912ccf7954427c4a097c566b12ee6620f9587
+--- /dev/null
++++ b/vllm/models/glm5next/__init__.py
+@@ -0,0 +1,18 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from vllm.platforms import current_platform
++
++if current_platform.is_rocm() or current_platform.is_xpu():
++    raise NotImplementedError(
++        "GLM-5.3-Flash currently supports NVIDIA SM90 and above only."
++    )
++
++from .nvidia.model import Glm5NextForCausalLM, Glm5NextForConditionalGeneration
++from .nvidia.mtp import Glm5NextMTP
++
++__all__ = [
++    "Glm5NextForCausalLM",
++    "Glm5NextForConditionalGeneration",
++    "Glm5NextMTP",
++]

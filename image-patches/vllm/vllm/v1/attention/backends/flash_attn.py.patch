@@ -1,0 +1,22 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 97f30736f..5f21c0d99 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -980,7 +980,9 @@ class FlashAttentionImpl(AttentionImpl):
+             k_descale = layer._k_scale.expand(descale_shape)
+             v_descale = layer._v_scale.expand(descale_shape)
+ 
+-            if self.dcp_world_size > 1:
++            if self.dcp_world_size > 1 and not getattr(
++                layer, "dcp_replicated", False
++            ):
+                 self._forward_with_dcp(
+                     query[:num_actual_tokens],
+                     key[:num_actual_tokens],

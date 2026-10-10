@@ -1,0 +1,39 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/comm/test_pcie_hierarchical.py b/tests/comm/test_pcie_hierarchical.py
+index d7054d0..1bc9532 100644
+--- a/tests/comm/test_pcie_hierarchical.py
++++ b/tests/comm/test_pcie_hierarchical.py
+@@ -101,6 +101,8 @@ def test_allreduce_factory_keeps_tp16_equal_quarter_opt_in(
+ @pytest.mark.parametrize(
+     ("world_size", "algorithm", "expected"),
+     [
++        (2, "auto", 4 * 1024 * 1024),
++        (4, "auto", 256 * 1024),
+         (8, "auto", 84 * 1024),
+         (12, "auto", 84 * 1024),
+         (16, "auto", 84 * 1024),
+@@ -115,9 +117,18 @@ def test_recommended_max_bytes_matches_available_tp_runtime(
+     expected: int,
+ ) -> None:
+     monkeypatch.setenv("B12X_PCIE_ALLREDUCE_ALGORITHM", algorithm)
++    monkeypatch.delenv("B12X_PCIE_TP2_REMOTE_PUSH", raising=False)
+     assert recommended_max_bytes(world_size, default=84 * 1024) == expected
+ 
+ 
++def test_tp2_recommended_capacity_honors_remote_push_disable(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "0")
++
++    assert recommended_max_bytes(2, default=84 * 1024) == 84 * 1024
++
++
+ def test_recommended_max_bytes_rejects_unknown_algorithm(
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:

@@ -1,0 +1,7 @@
+# Block 1c: name the faulting kernel first, then repro rate.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+source debug 2 1 8
+upstream baseline 2 5 8
+source baseline 2 2 8
+source debug 2 2 8
+source baseline 1 1 4

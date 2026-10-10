@@ -1,0 +1,74 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 92b638d05..015f3bec0 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -69,6 +69,8 @@ logger = init_logger(__name__)
+ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
+     {
+         "DeepseekV2ForCausalLM",
++        "Glm5NextForCausalLM",
++        "Glm5NextForConditionalGeneration",
+         "GraniteMoeForCausalLM",
+         "InklingForCausalLM",
+         "InklingForConditionalGeneration",
+@@ -95,6 +97,9 @@ AUTO_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
+         "InklingForConditionalGeneration",
+         "KimiK3ForConditionalGeneration",
+         "KimiK3MTPModel",
++        "Glm5NextForCausalLM",
++        "Glm5NextForConditionalGeneration",
++        "Glm5NextMTPModel",
+         "KimiLinearForCausalLM",
+         "MiniMaxM3SparseForCausalLM",
+         "MiniMaxM3SparseForConditionalGeneration",
+@@ -690,6 +695,11 @@ class VllmConfig:
+         if self._dflash_needs_multi_kv_group():
+             return True
+ 
++        # DFlash2's candidate selector is implemented only by the V2 speculator.
++        # Letting this checkpoint reach V1 silently degrades it to DFlash1.
++        if self._is_dflash2_draft():
++            return True
++
+         if self.model_config is not None and self.model_config.is_diffusion:
+             return True
+ 
+@@ -713,6 +723,16 @@ class VllmConfig:
+ 
+         return True
+ 
++    def _is_dflash2_draft(self) -> bool:
++        """Return whether the configured DFlash checkpoint uses DFlash2."""
++        spec = self.speculative_config
++        if spec is None or spec.method != "dflash":
++            return False
++        draft_config = getattr(spec, "draft_model_config", None)
++        if draft_config is None:
++            return False
++        return "DFlash2DraftModel" in (draft_config.architectures or [])
++
+     def _dflash_needs_multi_kv_group(self) -> bool:
+         """Whether a DFlash draft mixes sliding-window and full attention."""
+         spec = self.speculative_config
+@@ -2495,8 +2515,13 @@ class VllmConfig:
+     def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
+         if self.model_config is None:
+             return self
++        cache_dtype = self.cache_config.cache_dtype
++        # nvfp4_ds_mla is a distinct packed MLA record implemented by the
++        # B12X sparse-MLA backend. Generic NVFP4 cache layouts remain invalid
++        # because they store full attention heads rather than MLA latents.
+         if (
+-            self.cache_config.cache_dtype.startswith("nvfp4")
++            cache_dtype.startswith("nvfp4")
++            and cache_dtype != "nvfp4_ds_mla"
+             and self.model_config.use_mla
+         ):
+             raise ValueError(

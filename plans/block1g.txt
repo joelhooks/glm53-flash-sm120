@@ -1,0 +1,7 @@
+# Block 1g: probe 4 (identity/pointers), then the causal test for hypothesis R:
+# async scheduling off, 2 engines x 8 waves (n=16 waves), then probe with async off.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+probe probe 2 7 8
+source no-async 2 1 8
+source no-async 2 2 8
+probe probe-no-async 2 1 8

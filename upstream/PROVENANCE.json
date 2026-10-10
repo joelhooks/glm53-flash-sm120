@@ -1,0 +1,29 @@
+{
+  "schema": "brandonmusic.glm53.runtime-provenance.v1",
+  "release": "r19-sm120-tp2-ep2-dcp2-v84-dflash2",
+  "author": "Brandon M. Music",
+  "source": "https://github.com/brandonmmusic-max/glm-5.3-flash-exl3-4bpw",
+  "model": "https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw",
+  "parent_image": "klc/glm53-flash-exl3-k4:r19-sm120-tp2-ep2-dcp2-v83-dflash2-triton-swa-ab@sha256:6a0a4814b1e7aaa286a40ce8959cc9db2431b601a98a5be95b8020c748e0f5ea",
+  "target_quantization": "EXL3 uniform K4 routed experts",
+  "runtime": "SM120 TP2 EP2 DCP2 NVFP4 MLA KV DFlash2-7",
+  "dflash2_checkpoint": "incoai/GLM-5.3-Flash-DFlash2@7d74cdd881ed7e32c31175984a67823127b66cfe",
+  "dflash_reference": "local-inference-lab/vllm@e7097feb6fcdf57911cd68884420af2d80600dd7",
+  "fixes": {
+    "triton_noncausal_sliding_window": "full draft query block plus backward-only historical window",
+    "vision_rope": "native PyTorch fallback when vllm_flash_attn.layers is not packaged",
+    "aux_capture": "JJ immediate per-feature sequence-parallel gather"
+  },
+  "source_sha256": {
+    "triton_attention_helpers.py": "c70eae05bedaba3525a06c75677e3844948e32c980cc52f9e29cae0e19468006",
+    "int4_per_token_head.py": "d9cd730a1b1cbd93f70efd9399d965d89dff0f2abd7dc2021e97dd00f7bb68e8",
+    "rotary_embedding_common.py": "8fabf57cee7b127c71d57745a0fe99a312793ec4848fe38dfb9810d0e0554ade",
+    "multimodal_chat_template.jinja": "34d5ee66b12fa6446cdae131c352b8f68cd85369e0e6fda115583805fada3891"
+  },
+  "validation_sha256": {
+    "gsm8k_first16_max_acceptance.jsonl": "115eb8a7ac6666c2297b60db6027a93b2cc4ef1b84cb81ae395ea6b274cafae8",
+    "llm_decode_c1_c4_64k.json": "682cd8b240cb1ea4dd3910e0a6c8f5527f2a2971c58828c0a1c8fec38a4b0de8",
+    "llm_decode_c1_c4_64k.tui.log": "3235f8d19d9438384f217e68b4e1f3342c73b59212776520d680abc8075f03b4"
+  },
+  "generated_utc": "2026-08-28T05:45:00Z"
+}

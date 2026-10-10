@@ -1,0 +1,94 @@
+--- a/vllm/models/glm5next/nvidia/kda.py
++++ b/vllm/models/glm5next/nvidia/kda.py
+@@ -43,6 +43,75 @@
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+ 
+ 
++# --- glm-xid31 probe (debug only; inert unless GLMX_KDA_PROBE=1) ---
++import os as _glmx_os
++
++from vllm.logger import init_logger as _glmx_init_logger
++
++_glmx_log = _glmx_init_logger("vllm.glmx_probe")
++_GLMX_PROBE = _glmx_os.environ.get("GLMX_KDA_PROBE") == "1"
++_glmx_checks = {"mixed": 0, "prefill": 0}
++
++
++def _glmx_head(values, n=12):
++    return values if len(values) <= 2 * n else values[:n] + ["..."] + values[-n:]
++
++
++def _glmx_probe_prefill(prefix, q_ns, cu, state_idx, has_init, recurrent_state,
++                        use_spec, spec_cu, spec_idx, q_spec, num_spec_decodes,
++                        non_spec_token_indx, spec_token_indx, num_actual_tokens):
++    """Check that the device-side metadata agrees with the tensors the chunk
++    kernel will size its buffers from. Syncs the device; debug only."""
++    cu_l = [int(x) for x in cu.tolist()]
++    idx = [int(x) for x in state_idx.reshape(-1).tolist()]
++    t = int(q_ns.shape[0])
++    slots = int(recurrent_state.shape[0])
++    problems = []
++    if not cu_l or cu_l[0] != 0 or any(b < a for a, b in zip(cu_l, cu_l[1:])):
++        problems.append("non_spec cu_seqlens not monotone from 0")
++    if cu_l and cu_l[-1] != t:
++        problems.append(f"non_spec cu_seqlens[-1]={cu_l[-1]} != q_ns tokens={t}")
++    if len(cu_l) - 1 != len(idx):
++        problems.append(f"non_spec seqs={len(cu_l) - 1} != state rows={len(idx)}")
++    if int(has_init.numel()) != len(idx):
++        problems.append(f"has_initial_state={int(has_init.numel())} != state rows={len(idx)}")
++    bad = [i for i in idx if not 0 <= i < slots]
++    if bad:
++        problems.append(f"non_spec state ids out of [0,{slots}): {_glmx_head(bad)}")
++    detail = {"layer": prefix, "num_actual_tokens": int(num_actual_tokens),
++              "q_ns_tokens": t, "non_spec_cu": _glmx_head(cu_l),
++              "non_spec_state_ids": _glmx_head(idx), "state_slots": slots}
++    if use_spec:
++        scu = [int(x) for x in spec_cu.tolist()]
++        sidx = spec_idx.tolist()
++        ts = int(q_spec.shape[0]) if q_spec is not None else -1
++        detail.update(spec_cu=scu, spec_state_ids=sidx, q_spec_tokens=ts,
++                      num_spec_decodes=int(num_spec_decodes))
++        if scu[-1] != ts:
++            problems.append(f"spec cu_seqlens[-1]={scu[-1]} != q_spec tokens={ts}")
++        if len(scu) - 1 != int(num_spec_decodes):
++            problems.append(f"spec seqs={len(scu) - 1} != num_spec_decodes={int(num_spec_decodes)}")
++        flat = [int(v) for row in sidx for v in (row if isinstance(row, list) else [row])]
++        over = [v for v in flat if v >= slots]
++        if over:
++            problems.append(f"spec state ids >= {slots}: {_glmx_head(over)}")
++        if any(v < 0 for v in flat):
++            detail["spec_negative_ids"] = sum(v < 0 for v in flat)
++    if non_spec_token_indx is not None and spec_token_indx is not None:
++        ns_n, sp_n = int(non_spec_token_indx.numel()), int(spec_token_indx.numel())
++        detail.update(non_spec_token_indx_n=ns_n, spec_token_indx_n=sp_n)
++        if ns_n + sp_n != int(num_actual_tokens):
++            problems.append(f"token split {ns_n}+{sp_n} != num_actual_tokens={int(num_actual_tokens)}")
++    key = "mixed" if use_spec else "prefill"
++    _glmx_checks[key] += 1
++    if problems:
++        _glmx_log.error("GLMX_PROBE violation %s: %s", problems, detail)
++        raise RuntimeError(f"GLMX probe: KDA prefill metadata inconsistent: {problems}")
++    if prefix.endswith(".0.self_attn") or _glmx_checks[key] <= 3 or _glmx_checks[key] % 500 == 0:
++        if _glmx_checks[key] <= 3 or _glmx_checks[key] % 500 == 0:
++            _glmx_log.warning("GLMX_PROBE ok %s #%d %s", key, _glmx_checks[key], detail)
++
++
+ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
+     """Merged projection with multiple replicated output shards.
+ 
+@@ -547,6 +616,15 @@
+             assert q_ns is not None
+             assert non_spec_state_indices_tensor is not None
+             assert has_initial_state is not None
++            if _GLMX_PROBE:
++                _glmx_probe_prefill(
++                    self.prefix, q_ns, non_spec_query_start_loc,
++                    non_spec_state_indices_tensor, has_initial_state,
++                    recurrent_state, use_spec, spec_query_start_loc,
++                    spec_state_indices_tensor,
++                    q_spec if use_spec else None, num_spec_decodes,
++                    non_spec_token_indx, spec_token_indx, num_actual_tokens,
++                )
+             initial_state = gather_initial_states(
+                 recurrent_state, non_spec_state_indices_tensor, has_initial_state
+             )

@@ -1,0 +1,181 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/moe/test_dynamic_launch_tuning.py b/tests/moe/test_dynamic_launch_tuning.py
+new file mode 100644
+index 0000000..f280773
+--- /dev/null
++++ b/tests/moe/test_dynamic_launch_tuning.py
+@@ -0,0 +1,168 @@
++"""Unit coverage for shape-qualified dynamic MoE launch tuning."""
++
++from __future__ import annotations
++
++import pytest
++import torch
++
++from b12x.moe import fused_moe
++from b12x.moe._shared.dynamic_launch_tuning import (
++    DynamicLaunchTuning,
++    select_dynamic_launch_tuning,
++)
++from b12x.moe._shared.execution import WorkScheduler
++from b12x.moe.fused_moe import _impl as tp_moe_impl
++
++
++def _select(**overrides: object) -> DynamicLaunchTuning | None:
++    arguments: dict[str, object] = {
++        "compute_capability": (12, 0),
++        "quant_mode": "w4a8_mx",
++        "activation": "silu",
++        "num_experts": 256,
++        "hidden_size": 4096,
++        "intermediate_size": 512,
++        "top_k": 6,
++        "routed_rows": 48,
++        "qmma_repacked": True,
++        "deterministic_output": False,
++    }
++    arguments.update(overrides)
++    return select_dynamic_launch_tuning(**arguments)  # type: ignore[arg-type]
++
++
++@pytest.mark.parametrize(
++    ("routed_rows", "expected_mac"),
++    [
++        (25, 94),
++        (48, 94),
++        (96, 94),
++        (97, 72),
++        (144, 72),
++        (145, 84),
++        (192, 84),
++        (193, 64),
++        (768, 64),
++    ],
++)
++def test_sm120_w4a8_decode_tuning_covers_qualified_rows(
++    routed_rows: int,
++    expected_mac: int,
++) -> None:
++    tuning = _select(routed_rows=routed_rows)
++
++    assert tuning == DynamicLaunchTuning(
++        work_source="persistent_grid",
++        max_active_clusters=expected_mac,
++    )
++
++
++@pytest.mark.parametrize("routed_rows", [1, 24, 769, 1024])
++def test_sm120_w4a8_decode_tuning_preserves_unqualified_row_domains(
++    routed_rows: int,
++) -> None:
++    assert _select(routed_rows=routed_rows) is None
++
++
++@pytest.mark.parametrize("routed_rows", [25, 48, 96, 192])
++def test_sm120_tp2_w4a8_decode_tuning_uses_measured_resident_domain(
++    routed_rows: int,
++) -> None:
++    assert _select(
++        intermediate_size=1024,
++        routed_rows=routed_rows,
++    ) == DynamicLaunchTuning(
++        work_source="persistent_grid",
++        max_active_clusters=94,
++    )
++
++
++@pytest.mark.parametrize("routed_rows", [1, 24, 193, 768])
++def test_sm120_tp2_w4a8_decode_tuning_preserves_unqualified_rows(
++    routed_rows: int,
++) -> None:
++    assert _select(intermediate_size=1024, routed_rows=routed_rows) is None
++
++
++@pytest.mark.parametrize(
++    "overrides",
++    [
++        {"compute_capability": (12, 1)},
++        {"quant_mode": "w4a8_nvfp4"},
++        {"activation": "relu2"},
++        {"num_experts": 128},
++        {"hidden_size": 6144},
++        {"intermediate_size": 768},
++        {"top_k": 8},
++        {"qmma_repacked": False},
++        {"deterministic_output": True},
++    ],
++)
++def test_sm120_w4a8_decode_tuning_requires_the_complete_contract(
++    overrides: dict[str, object],
++) -> None:
++    assert _select(**overrides) is None
++
++
++def test_explicit_work_source_overrides_shape_tuning(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setattr(tp_moe_impl, "_current_compute_capability", lambda: (12, 0))
++    common = {
++        "quant_mode": "w4a8_mx",
++        "activation": "silu",
++        "num_experts": 256,
++        "hidden_size": 4096,
++        "intermediate_size": 512,
++        "top_k": 6,
++        "routed_rows": 96,
++        "qmma_repacked": True,
++        "deterministic_output": False,
++    }
++
++    monkeypatch.delenv("B12X_DYNAMIC_WORK_SOURCE", raising=False)
++    assert tp_moe_impl._resolve_dynamic_work_source(**common) == "persistent_grid"
++
++    monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", "materialized_queue")
++    assert tp_moe_impl._resolve_dynamic_work_source(**common) == "materialized_queue"
++
++
++def test_execution_plan_uses_tuning_only_above_the_small_decode_domain(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setattr(tp_moe_impl, "_current_compute_capability", lambda: (12, 0))
++    monkeypatch.delenv("B12X_DYNAMIC_WORK_SOURCE", raising=False)
++    weights = fused_moe.plan_weights(
++        quant_modes="w4a8_mx",
++        source_format="fp4_e8m0_k32",
++        activation="silu",
++        params_dtype=torch.bfloat16,
++        num_experts=256,
++        hidden_size=4096,
++        intermediate_size=512,
++    )
++
++    plans = {
++        tokens: fused_moe.plan_execution(
++            num_tokens=tokens,
++            num_topk=6,
++            device=torch.device("cuda"),
++            weight_plan=weights,
++            quant_mode="w4a8_mx",
++        )
++        for tokens in (4, 8, 16)
++    }
++
++    assert plans[4].execution.scheduler is WorkScheduler.DIRECT
++    assert plans[8].execution.scheduler is WorkScheduler.PERSISTENT_GRID
++    assert plans[16].execution.scheduler is WorkScheduler.PERSISTENT_GRID
++
++    monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", "materialized_queue")
++    forced = fused_moe.plan_execution(
++        num_tokens=16,
++        num_topk=6,
++        device=torch.device("cuda"),
++        weight_plan=weights,
++        quant_mode="w4a8_mx",
++    )
++    assert forced.execution.scheduler is WorkScheduler.ATOMIC_QUEUE

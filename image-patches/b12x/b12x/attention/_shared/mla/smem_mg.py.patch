@@ -1,0 +1,43 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/b12x/attention/_shared/mla/smem_mg.py b/b12x/attention/_shared/mla/smem_mg.py
+index c045d4c..f2185da 100644
+--- a/b12x/attention/_shared/mla/smem_mg.py
++++ b/b12x/attention/_shared/mla/smem_mg.py
+@@ -530,5 +530,31 @@ def _run_module_asserts() -> None:
+         )
+         get_prefill_mg_shared_storage_cls(glm, mg_n_hg=nhg)
+ 
++    # GLM-5.3-Flash NoPE (d_rope == 0, BF16 QK): same 288B NVFP4 latent staging
++    # as GLM_NSA NVFP4, no rope anywhere, and the kv_sc buffer exists only for
++    # the per-token fp32 latent scale (BI*4). The MG record STRIDE (288/304) is
++    # threaded into io_mg.io_issue_gather_glm_mg from the traits; the smem side
++    # is stride-independent, so only the buffer sizing is pinned here.
++    for pts in (False, True):
++        nope = make_unified_traits(
++            ModelType.GLM_NOPE,
++            ComputeMode.BF16,
++            ScaleFormat.NVFP4_E4M3,
++            latent_scale_per_token=pts,
++        )
++        assert nope.kv_gmem_stride == (304 if pts else 288)
++        for nhg in (1, 2):
++            nl = make_smem_layout_mg(nope, mg_n_hg=nhg)
++            assert nl.bf16_qk  # GLM_NOPE decode/prefill math is BF16.
++            assert nl.kv_smem_stride == 288
++            assert nl.kv_fp8_buf_bytes == 64 * 288
++            assert nl.kv_sc_buf_bytes == (64 * 4 if pts else 0)
++            assert nl.kv_rope_buf_bytes == 0  # no rope sub-record at all.
++            assert nl.total_bytes < SM120_SMEM_CARVEOUT_BYTES, (
++                f"GLM_NOPE MG prefill smem {nl.total_bytes}B exceeds SM120 "
++                f"carveout {SM120_SMEM_CARVEOUT_BYTES}B (mg_n_hg={nhg})"
++            )
++            get_prefill_mg_shared_storage_cls(nope, mg_n_hg=nhg)
++
+ 
+ _run_module_asserts()

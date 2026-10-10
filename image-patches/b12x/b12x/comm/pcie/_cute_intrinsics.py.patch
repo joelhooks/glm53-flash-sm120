@@ -1,0 +1,178 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/b12x/comm/pcie/_cute_intrinsics.py b/b12x/comm/pcie/_cute_intrinsics.py
+index f65c602..7f5c079 100644
+--- a/b12x/comm/pcie/_cute_intrinsics.py
++++ b/b12x/comm/pcie/_cute_intrinsics.py
+@@ -143,6 +143,166 @@ def st_global_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> None:
+     )
+ 
+ 
++@dsl_user_op
++def ld_volatile_global_v4_u32(
++    addr: Int64, *, loc=None, ip=None
++) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
++    """Load one PCIe-visible 16-byte payload without retaining a cached value."""
++
++    result = llvm.inline_asm(
++        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
++        [Int64(addr).ir_value(loc=loc, ip=ip)],
++        "ld.volatile.global.v4.b32 {$0, $1, $2, $3}, [$4];",
++        "=r,=r,=r,=r,l",
++        has_side_effects=True,
++        is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++        loc=loc,
++        ip=ip,
++    )
++    return tuple(
++        Uint32(llvm.extractvalue(T.i32(), result, [index], loc=loc, ip=ip))
++        for index in range(4)
++    )
++
++
++@dsl_user_op
++def st_volatile_global_v4_u32(
++    addr: Int64,
++    v0: Uint32,
++    v1: Uint32,
++    v2: Uint32,
++    v3: Uint32,
++    *,
++    loc=None,
++    ip=None,
++) -> None:
++    """Store one PCIe-visible 16-byte payload without compiler reordering."""
++
++    llvm.inline_asm(
++        None,
++        [
++            Int64(addr).ir_value(loc=loc, ip=ip),
++            Uint32(v0).ir_value(loc=loc, ip=ip),
++            Uint32(v1).ir_value(loc=loc, ip=ip),
++            Uint32(v2).ir_value(loc=loc, ip=ip),
++            Uint32(v3).ir_value(loc=loc, ip=ip),
++        ],
++        "st.volatile.global.v4.b32 [$0], {$1, $2, $3, $4};",
++        "l,r,r,r,r",
++        has_side_effects=True,
++        is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++        loc=loc,
++        ip=ip,
++    )
++
++
++@dsl_user_op
++def clear_pos_zero_u16x2(value: Uint32, *, loc=None, ip=None) -> Uint32:
++    """Reserve positive zero in each 16-bit lane as an unpublished marker."""
++
++    return Uint32(
++        llvm.inline_asm(
++            T.i32(),
++            [Uint32(value).ir_value(loc=loc, ip=ip)],
++            """
++            {
++                .reg .pred lo_set, hi_set;
++                .reg .b32 lo, hi;
++                and.b32 lo, $1, 0x0000ffff;
++                and.b32 hi, $1, 0xffff0000;
++                setp.ne.u32 lo_set, lo, 0;
++                setp.ne.u32 hi_set, hi, 0;
++                selp.u32 lo, lo, 0x00008000, lo_set;
++                selp.u32 hi, hi, 0x80000000, hi_set;
++                or.b32 $0, lo, hi;
++            }
++            """,
++            "=r,r",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def has_pos_zero_u16x2(value: Uint32, *, loc=None, ip=None) -> Uint32:
++    """Return one while either 16-bit lane is still unpublished."""
++
++    return Uint32(
++        llvm.inline_asm(
++            T.i32(),
++            [Uint32(value).ir_value(loc=loc, ip=ip)],
++            """
++            {
++                .reg .pred lo_zero, hi_zero, waiting;
++                .reg .b32 lo, hi;
++                and.b32 lo, $1, 0x0000ffff;
++                and.b32 hi, $1, 0xffff0000;
++                setp.eq.u32 lo_zero, lo, 0;
++                setp.eq.u32 hi_zero, hi, 0;
++                or.pred waiting, lo_zero, hi_zero;
++                selp.u32 $0, 1, 0, waiting;
++            }
++            """,
++            "=r,r",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def add_f16x2(left: Uint32, right: Uint32, *, loc=None, ip=None) -> Uint32:
++    """Add two packed FP16 lanes with round-to-nearest semantics."""
++
++    return Uint32(
++        llvm.inline_asm(
++            T.i32(),
++            [
++                Uint32(left).ir_value(loc=loc, ip=ip),
++                Uint32(right).ir_value(loc=loc, ip=ip),
++            ],
++            "add.rn.f16x2 $0, $1, $2;",
++            "=r,r,r",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def add_bf16x2(left: Uint32, right: Uint32, *, loc=None, ip=None) -> Uint32:
++    """Add two packed BF16 lanes with round-to-nearest semantics."""
++
++    return Uint32(
++        llvm.inline_asm(
++            T.i32(),
++            [
++                Uint32(left).ir_value(loc=loc, ip=ip),
++                Uint32(right).ir_value(loc=loc, ip=ip),
++            ],
++            "add.rn.bf16x2 $0, $1, $2;",
++            "=r,r,r",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
+ @dsl_user_op
+ def st_global_f32(addr: Int64, value: Float32, *, loc=None, ip=None) -> None:
+     llvm.inline_asm(

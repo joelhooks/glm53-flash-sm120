@@ -1,0 +1,289 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/comm/test_plain_allreduce_calibration.py b/tests/comm/test_plain_allreduce_calibration.py
+new file mode 100644
+index 0000000..69c8164
+--- /dev/null
++++ b/tests/comm/test_plain_allreduce_calibration.py
+@@ -0,0 +1,276 @@
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import signal
++import subprocess
++from types import SimpleNamespace
++
++import pytest
++
++import b12x.comm.pcie.plain_allreduce_calibration as calibration
++
++
++def _policy(*, world_size: int = 4) -> dict[str, object]:
++    return {
++        "version": 1,
++        "world_size": world_size,
++        "hidden_size": 4096,
++        "dtype": "bfloat16",
++        "measured_rows": [1, 2, 4, 8],
++        "custom_rows": [1, 2, 4],
++    }
++
++
++def _result(*, world_size: int = 4) -> dict[str, object]:
++    return {
++        "policy": _policy(world_size=world_size),
++        "points": [],
++        "selection": {
++            "min_absolute_margin_us": 0.25,
++            "min_relative_margin": 0.01,
++        },
++    }
++
++
++def _args(tmp_path: Path, **overrides: object) -> SimpleNamespace:
++    values: dict[str, object] = {
++        "world_size": 4,
++        "hidden_size": 4096,
++        "rows": (1, 2, 4, 8),
++        "dtype": "bfloat16",
++        "visible_devices": "4,5,6,7",
++        "cache_dir": tmp_path,
++        "timeout": 5.0,
++        "warmup": 8,
++        "repeat": 41,
++        "ops_per_sample": 8,
++        "trials": 3,
++        "stabilization_replays": 2048,
++        "min_absolute_margin_us": 0.25,
++        "min_relative_margin": 0.01,
++        "force": False,
++    }
++    values.update(overrides)
++    return SimpleNamespace(**values)
++
++
++def _inventory() -> list[dict[str, object]]:
++    return [
++        {
++            "index": index,
++            "uuid": f"GPU-{index}",
++            "pci_bus_id": f"0000:{index:02x}:00.0",
++            "max_generation": 5,
++            "max_width": 16,
++            "driver_version": "999.1",
++            "free_mib": 90000,
++            "upstream": {
++                "upstream_bdf": f"0000:{index:02x}:01.1",
++                "link_control": ("LnkCtl2: Target Link Speed: 32GT/s",),
++            },
++        }
++        for index in range(8)
++    ]
++
++
++def test_positive_ints_rejects_duplicates_and_nonpositive_rows() -> None:
++    assert calibration._positive_ints("1,2,4") == (1, 2, 4)
++    with pytest.raises(Exception, match="unique"):
++        calibration._positive_ints("1,1")
++    with pytest.raises(Exception, match="positive"):
++        calibration._positive_ints("0,1")
++
++
++def test_gpu_selection_preserves_visible_device_order() -> None:
++    selected = calibration._select_gpus(
++        _inventory(),
++        world_size=4,
++        visible_devices="6,4,7,5",
++    )
++
++    assert [item["index"] for item in selected] == [6, 4, 7, 5]
++
++
++def test_fingerprint_changes_with_upstream_target_speed(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    inventory = _inventory()
++    monkeypatch.setattr(calibration, "_nvidia_inventory", lambda: inventory)
++    monkeypatch.setattr(calibration, "_package_version", lambda _name: "1")
++    monkeypatch.setattr(calibration, "_source_digest", lambda: "source")
++    first = calibration.build_fingerprint_payload(_args(tmp_path))
++
++    inventory[4]["upstream"] = {
++        "upstream_bdf": "0000:04:01.1",
++        "link_control": ("LnkCtl2: Target Link Speed: 16GT/s",),
++    }
++    second = calibration.build_fingerprint_payload(_args(tmp_path))
++
++    assert calibration.fingerprint(first) != calibration.fingerprint(second)
++
++
++def test_collective_environment_excludes_policy_and_controller_knobs(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setenv("NCCL_MIN_NCHANNELS", "8")
++    monkeypatch.setenv("B12X_PCIE_PLAIN_ALLREDUCE_POLICY", "old-policy")
++    monkeypatch.setenv("B12X_PCIE_PLAIN_ALLREDUCE_CALIBRATION", "force")
++    monkeypatch.setenv("UNRELATED_VALUE", "ignored")
++
++    environment = calibration._collective_environment()
++
++    assert environment["NCCL_MIN_NCHANNELS"] == "8"
++    assert "B12X_PCIE_PLAIN_ALLREDUCE_POLICY" not in environment
++    assert "B12X_PCIE_PLAIN_ALLREDUCE_CALIBRATION" not in environment
++    assert "UNRELATED_VALUE" not in environment
++
++
++def test_validate_probe_result_requires_exact_requested_contract() -> None:
++    result = _result()
++    encoded = calibration.validate_probe_result(
++        result,
++        world_size=4,
++        hidden_size=4096,
++        rows=(1, 2, 4, 8),
++        dtype="bfloat16",
++    )
++    assert json.loads(encoded) == _policy()
++
++    result["policy"]["measured_rows"] = [1, 2, 4]
++    with pytest.raises(ValueError, match="every requested row"):
++        calibration.validate_probe_result(
++            result,
++            world_size=4,
++            hidden_size=4096,
++            rows=(1, 2, 4, 8),
++            dtype="bfloat16",
++        )
++
++
++def test_cache_rejects_wrong_fingerprint_or_policy_contract(tmp_path: Path) -> None:
++    args = _args(tmp_path)
++    path = tmp_path / "record.json"
++    record = {
++        "schema": calibration.SCHEMA_VERSION,
++        "fingerprint": "expected",
++        "probe": _result(),
++    }
++    path.write_text(json.dumps(record), encoding="utf-8")
++
++    loaded = calibration._load_record(
++        path,
++        expected_fingerprint="expected",
++        args=args,
++    )
++    assert loaded is not None
++    assert json.loads(loaded[1]) == _policy()
++    assert (
++        calibration._load_record(
++            path,
++            expected_fingerprint="different",
++            args=args,
++        )
++        is None
++    )
++
++    record["probe"]["policy"]["hidden_size"] = 6144
++    path.write_text(json.dumps(record), encoding="utf-8")
++    assert (
++        calibration._load_record(
++            path,
++            expected_fingerprint="expected",
++            args=args,
++        )
++        is None
++    )
++
++
++def test_probe_timeout_terminates_complete_process_group(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    class TimeoutProcess:
++        pid = 4242
++        returncode = -signal.SIGTERM
++
++        def __init__(self) -> None:
++            self.calls = 0
++
++        def communicate(self, timeout: float | None = None) -> tuple[str, None]:
++            self.calls += 1
++            if self.calls == 1:
++                raise subprocess.TimeoutExpired("probe", timeout or 0)
++            return "workers terminated\n", None
++
++    process = TimeoutProcess()
++    signals: list[tuple[int, int]] = []
++    popen_kwargs: dict[str, object] = {}
++
++    def fake_popen(*_args: object, **kwargs: object) -> TimeoutProcess:
++        popen_kwargs.update(kwargs)
++        return process
++
++    monkeypatch.setattr(calibration.subprocess, "Popen", fake_popen)
++    monkeypatch.setattr(
++        calibration.os,
++        "killpg",
++        lambda pid, value: signals.append((pid, value)),
++    )
++
++    with pytest.raises(calibration.CalibrationFailure, match="timed out") as failure:
++        calibration._run_probe(_args(tmp_path), tmp_path / "probe.json")
++
++    assert failure.value.detail == "workers terminated\n"
++    assert signals == [(4242, signal.SIGTERM)]
++    assert popen_kwargs["start_new_session"] is True
++
++
++def test_calibrate_uses_valid_cache_before_memory_preflight(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    args = _args(tmp_path)
++    payload = {"stable": "fingerprint"}
++    digest = calibration.fingerprint(payload)
++    cache_path = tmp_path / f"{digest}.json"
++    calibration._atomic_write(
++        cache_path,
++        {
++            "schema": calibration.SCHEMA_VERSION,
++            "fingerprint": digest,
++            "probe": _result(),
++        },
++    )
++    monkeypatch.setattr(calibration, "build_fingerprint_payload", lambda _args: payload)
++    monkeypatch.setattr(
++        calibration,
++        "_nvidia_inventory",
++        lambda: pytest.fail("cache hit must not inspect current free memory"),
++    )
++
++    status, policy, resolved_path = calibration.calibrate(args)
++
++    assert status == "cache-hit"
++    assert json.loads(policy) == _policy()
++    assert resolved_path == cache_path
++
++
++def test_default_stabilization_budget_is_not_an_idle_state_sample(
++    tmp_path: Path,
++) -> None:
++    args = calibration._build_parser().parse_args(
++        [
++            "--world-size",
++            "4",
++            "--hidden-size",
++            "4096",
++            "--rows",
++            "1,2,4,8",
++            "--cache-dir",
++            str(tmp_path),
++        ]
++    )
++
++    assert args.stabilization_replays == 2048

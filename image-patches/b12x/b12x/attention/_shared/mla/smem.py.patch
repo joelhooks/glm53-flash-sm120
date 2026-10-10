@@ -1,0 +1,343 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/b12x/attention/_shared/mla/smem.py b/b12x/attention/_shared/mla/smem.py
+index 5539ba9..f8b3577 100644
+--- a/b12x/attention/_shared/mla/smem.py
++++ b/b12x/attention/_shared/mla/smem.py
+@@ -47,8 +47,14 @@ Regions (DSV4 ``DecodeDsv4Smem`` order; offsets are const_expr ints):
+   * ``sm_p_full``  HPB x BI bf16              (normalized P; 128B-aligned for the
+                                                S6b ldmatrix.x4 read)
+ 
+-Total dynamic smem stays < the SM120 carveout (~92KB DSV4, ~96KB GLM) and the
+-import-time asserts pin ``KV_SMEM_STRIDE`` to the traits.
++A region that is empty for a given specialization is ABSENT, not zero-width:
++GLM NoPE (``d_rope == 0``) has neither ``q_rope`` nor ``kv_rope``, so both are
++omitted from ``SharedStorage`` and their layout offsets are
++``ABSENT_REGION_OFF``. A zero-width region would otherwise inherit the NEXT
++region's offset and alias it (``kv_rope`` landed exactly on ``mbar``).
++
++Total dynamic smem stays < the SM120 carveout (~92KB DSV4, ~96KB GLM, ~59KB
++GLM NoPE) and the import-time asserts pin ``KV_SMEM_STRIDE`` to the traits.
+ """
+ 
+ from __future__ import annotations
+@@ -65,6 +71,15 @@ from .traits import ScaleFormat, UnifiedMLATraits
+ # SMEM_CAPACITY_MAP; proven launchable by .sm120port/probes/gate_g2_smem.py).
+ SM120_SMEM_CARVEOUT_BYTES = 101376
+ 
++# Offset published for a region whose width is 0 in THIS specialization (GLM
++# NoPE has no q_rope and no kv_rope at all: d_rope == 0). A zero-width region
++# has no address, and giving it the next region's byte offset makes it ALIAS
++# that region silently -- for GLM_NOPE, kv_rope resolved to exactly ``mbar_off``
++# and q_rope to ``q_fp8_off``. Absent regions therefore publish a sentinel that
++# cannot be mistaken for a valid offset, and ``get_unified_shared_storage_cls``
++# omits the typed field entirely so a stale reader gets a loud AttributeError.
++ABSENT_REGION_OFF = -1
++
+ # Double-buffered KV gather (full/empty parity). The P5 synchronous loader only
+ # uses buf 0 per chunk, but the two-buffer sizing is pinned now so the P6
+ # mbarrier pipeline (w_fp8[vc&1]-style ping-pong) drops in without a relayout.
+@@ -112,6 +127,8 @@ class SmemLayout:
+ 
+     # --- Q staging (single buffer; HPB heads). ---
+     # q_rope FIRST to match FlashInfer DecodeDsv4Smem OFF_Q_ROPE = 0.
++    # ``q_rope_off``/``kv_rope_off`` are ABSENT_REGION_OFF (-1) when d_rope == 0
++    # (GLM NoPE): the region does not exist and has no address.
+     q_rope_off: int
+     q_rope_bytes: int
+     q_rope_stride: int  # D_ROPE plus optional bank-conflict pad
+@@ -210,12 +227,17 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
+     off = 0
+ 
+     # --- Q rope (bf16), FlashInfer OFF_Q_ROPE = 0. ---
+-    q_rope_off = off
+     # DSV4's 64-bf16 rows otherwise repeat every 128 bytes and alias banks
+     # across heads during the native H8/H16 scalar Q-RoPE loads.
+     q_rope_stride = d_rope + (8 if traits.has_extra_cache else 0)
+     q_rope_bytes = hpb * q_rope_stride * 2
+-    off = q_rope_off + q_rope_bytes  # FlashInfer packs Q regions back-to-back
++    if q_rope_bytes:
++        q_rope_off = off
++        off = q_rope_off + q_rope_bytes  # FlashInfer packs Q regions back-to-back
++    else:
++        # NoPE (d_rope == 0): there is no Q-RoPE tile. Absent, not zero-width
++        # at q_fp8's offset (see ABSENT_REGION_OFF).
++        q_rope_off = ABSENT_REGION_OFF
+ 
+     # --- Q-NoPE staging. FP8 normally; BF16 for native NVFP4 cache math. ---
+     q_fp8_off = off
+@@ -257,10 +279,16 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
+         kv_sc_buf_bytes = 0
+ 
+     # --- Double-buffered KV rope (bf16) linear entry*D_ROPE + d. ---
+-    kv_rope_off = off
+     kv_rope_stride = d_rope
+     kv_rope_buf_bytes = bi * d_rope * 2
+-    off = kv_rope_off + kv_rope_buf_bytes * bufs
++    if kv_rope_buf_bytes:
++        kv_rope_off = off
++        off = kv_rope_off + kv_rope_buf_bytes * bufs
++    else:
++        # NoPE (d_rope == 0): there is no KV-RoPE stage. Publishing ``off`` here
++        # would put it exactly ON the mbarrier array below, which is what made
++        # the io.py rope copy catastrophic instead of merely wasteful.
++        kv_rope_off = ABSENT_REGION_OFF
+ 
+     # --- P6 mbarrier pair placeholder (16B aligned; reserved, unused in P5). ---
+     off = _align_up(off, 16)
+@@ -396,6 +424,34 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
+         if (traits.has_extra_cache or traits.latent_scale_per_token)
+         else {}
+     )
++    # d_rope == 0 (GLM NoPE) -> no Q-RoPE / KV-RoPE region exists. Omit the
++    # fields entirely (same **field splat as kv_sc / w_head_sc2) instead of
++    # allocating 0 bytes: a zero-width MemRange takes the NEXT region's offset,
++    # so ``kv_rope`` silently aliased the mbarrier array and ``q_rope`` aliased
++    # ``q_fp8``. Absent fields make any stale reader fail with AttributeError.
++    q_rope_field = (
++        {
++            "q_rope": cute.struct.Align[
++                cute.struct.MemRange[cutlass.BFloat16, int(layout.q_rope_bytes // 2)],
++                128,
++            ]
++        }
++        if layout.q_rope_bytes
++        else {}
++    )
++    kv_rope_field = (
++        {
++            "kv_rope": cute.struct.Align[
++                cute.struct.MemRange[
++                    cutlass.BFloat16,
++                    int(layout.kv_rope_buf_bytes * layout.kv_bufs // 2),
++                ],
++                16,
++            ]
++        }
++        if layout.kv_rope_buf_bytes
++        else {}
++    )
+     w_head_sc2_field = (
+         {
+             "w_head_sc2": cute.struct.Align[
+@@ -410,10 +466,7 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
+     )
+     SharedStorage.__annotations__ = {
+         # Q staging (single buffer). q_rope first (FlashInfer OFF_Q_ROPE = 0).
+-        "q_rope": cute.struct.Align[
+-            cute.struct.MemRange[cutlass.BFloat16, int(layout.q_rope_bytes // 2)],
+-            128,
+-        ],
++        **q_rope_field,
+         "q_fp8": cute.struct.MemRange[cutlass.Uint8, int(layout.q_fp8_bytes)],
+         "q_sc": cute.struct.MemRange[cutlass.Float32, int(layout.q_sc_bytes // 4)],
+         # Double-buffered KV. 128B-align the big nope region.
+@@ -425,13 +478,9 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
+         ],
+         **kv_sc_field,
+         # 16B-align kv_rope for cp.async.bulk and ldmatrix. DSV4's footer is
+-        # already 128B-sized; GLM has no footer field at all.
+-        "kv_rope": cute.struct.Align[
+-            cute.struct.MemRange[
+-                cutlass.BFloat16, int(layout.kv_rope_buf_bytes * layout.kv_bufs // 2)
+-            ],
+-            16,
+-        ],
++        # already 128B-sized; GLM has no footer field at all. NoPE has no
++        # kv_rope field at all (d_rope == 0).
++        **kv_rope_field,
+         # P6 mbarrier array (u64 full[2]+empty[2]). 16B-aligned.
+         "mbar": cute.struct.Align[
+             cute.struct.MemRange[cutlass.Uint64, int(layout.mbar_bytes // 8)],
+@@ -467,11 +516,9 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
+     storage_cls = cute.struct(SharedStorage)
+ 
+     expected_offsets = {
+-        "q_rope": layout.q_rope_off,
+         "q_fp8": layout.q_fp8_off,
+         "q_sc": layout.q_sc_off,
+         "kv_fp8": layout.kv_fp8_off,
+-        "kv_rope": layout.kv_rope_off,
+         "mbar": layout.mbar_off,
+         "reduce": layout.reduce_off,
+         "w_head_sc": layout.w_head_sc_off,
+@@ -479,6 +526,10 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
+         "token_idx": layout.token_idx_off,
+         "sm_p_full": layout.sm_p_full_off,
+     }
++    if layout.q_rope_bytes:
++        expected_offsets["q_rope"] = layout.q_rope_off
++    if layout.kv_rope_buf_bytes:
++        expected_offsets["kv_rope"] = layout.kv_rope_off
+     if traits.has_extra_cache or traits.latent_scale_per_token:
+         expected_offsets["kv_sc"] = layout.kv_sc_off
+     if traits.has_extra_cache:
+@@ -503,11 +554,24 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
+ # import time (pure Python) and guard against a layout change blowing the SM120
+ # carveout or desyncing KV_SMEM_STRIDE / Q_NOPE_STRIDE from the traits.
+ # ---------------------------------------------------------------------------
+-def _assert_model(model_type: int, compute_mode: int, scale_format: int) -> int:
++def _assert_model(
++    model_type: int,
++    compute_mode: int,
++    scale_format: int,
++    *,
++    fp8_rope: bool | None = None,
++    latent_scale_per_token: bool = False,
++) -> int:
+     # Imported lazily to keep this module's top-level import order simple.
+     from .traits import make_unified_traits
+ 
+-    traits = make_unified_traits(model_type, compute_mode, scale_format)
++    traits = make_unified_traits(
++        model_type,
++        compute_mode,
++        scale_format,
++        fp8_rope=fp8_rope,
++        latent_scale_per_token=latent_scale_per_token,
++    )
+     layout = make_smem_layout(traits)
+     # This constructor validates every typed field offset and the exact total
+     # that CUTLASS DSL 4.6 infers for the launch's dynamic shared memory.
+@@ -520,20 +584,84 @@ def _assert_model(model_type: int, compute_mode: int, scale_format: int) -> int:
+         f"Q_NOPE_STRIDE mismatch: layout={layout.q_nope_stride} "
+         f"traits={traits.q_nope_stride}"
+     )
+-    # DSV4 has the separate UE8M0 footer buffer; GLM keeps scales inline.
++    # The separate kv_sc buffer exists for EXACTLY two reasons, and its width is
++    # decided by which one applies:
++    #   * DSV4 dual-cache: the grouped 8B UE8M0 footer per token (BI*8), or
++    #   * NVFP4 two-level records: the fp32 per-token latent scale (BI*4) --
++    #     GLM_NSA's 368B fp8-rope record and GLM_NOPE's 304B record both.
++    # Everything else keeps its scales INLINE in the kv_fp8 row (0 bytes). The
++    # old "not has_extra_cache => must be 0" form asserted the DSV4-vs-GLM split
++    # rather than the invariant, so it fired on any latent_scale_per_token
++    # layout (both the 368B GLM_NSA record and the 304B NoPE one).
+     if traits.has_extra_cache:
+-        assert layout.kv_sc_buf_bytes == traits.bi * 8, (
+-            f"DSV4 kv_sc footer buf must be BI*8; got {layout.kv_sc_buf_bytes}"
+-        )
++        expected_kv_sc = traits.bi * 8
++    elif traits.latent_scale_per_token:
++        expected_kv_sc = traits.bi * 4
+     else:
+-        assert layout.kv_sc_buf_bytes == 0, (
+-            f"GLM scales are inline; kv_sc footer buf must be 0, "
+-            f"got {layout.kv_sc_buf_bytes}"
+-        )
++        expected_kv_sc = 0
++    assert layout.kv_sc_buf_bytes == expected_kv_sc, (
++        f"kv_sc buf must be {expected_kv_sc}B (has_extra_cache="
++        f"{traits.has_extra_cache}, latent_scale_per_token="
++        f"{traits.latent_scale_per_token}); got {layout.kv_sc_buf_bytes}"
++    )
+     # Sub-region offsets must be monotonic + non-overlapping (sanity on packing).
+-    assert layout.q_rope_off == 0
+-    assert layout.q_fp8_off >= layout.q_rope_off + layout.q_rope_bytes
++    # q_rope leads the layout (FlashInfer OFF_Q_ROPE = 0) whenever it exists at
++    # all; NoPE has no Q-RoPE tile, so it is ABSENT and q_fp8 leads instead.
++    if layout.q_rope_bytes:
++        assert layout.q_rope_off == 0
++        assert layout.q_fp8_off >= layout.q_rope_off + layout.q_rope_bytes
++    else:
++        assert layout.q_rope_off == ABSENT_REGION_OFF
++        assert layout.q_fp8_off == 0
+     assert layout.kv_fp8_off >= layout.q_sc_off + layout.q_sc_bytes
++    # STRICT packing check. ``q_fp8_off >= q_rope_off + q_rope_bytes`` degrades
++    # to ``0 >= 0`` for a zero-width region and so cannot see aliasing; walk the
++    # regions instead and require every LIVE one to own a disjoint byte range.
++    # A zero-width region is not a region: it must be ABSENT (q_rope/kv_rope) or
++    # never materialized as a typed field (kv_sc / w_head_sc2), so it is skipped
++    # here rather than compared against a neighbour it does not overlap.
++    regions = (
++        ("q_rope", layout.q_rope_off, layout.q_rope_bytes),
++        ("q_fp8", layout.q_fp8_off, layout.q_fp8_bytes),
++        ("q_sc", layout.q_sc_off, layout.q_sc_bytes),
++        ("kv_fp8", layout.kv_fp8_off, layout.kv_fp8_buf_bytes * layout.kv_bufs),
++        ("kv_sc", layout.kv_sc_off, layout.kv_sc_buf_bytes * layout.kv_bufs),
++        ("kv_rope", layout.kv_rope_off, layout.kv_rope_buf_bytes * layout.kv_bufs),
++        ("mbar", layout.mbar_off, layout.mbar_bytes),
++        ("reduce", layout.reduce_off, layout.reduce_bytes),
++        ("w_head_sc", layout.w_head_sc_off, layout.w_head_sc_bytes),
++        ("w_fp8", layout.w_fp8_off, layout.w_fp8_buf_bytes * layout.w_fp8_bufs),
++        (
++            "token_idx",
++            layout.token_idx_off,
++            layout.token_idx_buf_bytes * layout.token_idx_bufs,
++        ),
++        ("sm_p_full", layout.sm_p_full_off, layout.sm_p_full_bytes),
++        ("w_head_sc2", layout.w_head_sc2_off, layout.w_head_sc2_bytes),
++    )
++    live = sorted(
++        ((off, name, nbytes) for name, off, nbytes in regions if nbytes > 0),
++    )
++    owner: dict[int, str] = {}
++    for off, name, _nbytes in live:
++        assert off >= 0, f"live region {name} has sentinel offset {off}"
++        assert off not in owner, (
++            f"smem regions {owner[off]} and {name} share offset {off} "
++            f"for model_type={model_type}"
++        )
++        owner[off] = name
++    for (off, name, nbytes), (next_off, next_name, _) in zip(
++        live, live[1:], strict=False
++    ):
++        assert off + nbytes <= next_off, (
++            f"smem region {name} [{off}, {off + nbytes}) overlaps {next_name} "
++            f"at {next_off} for model_type={model_type}"
++        )
++    last_off, last_name, last_bytes = live[-1]
++    assert last_off + last_bytes <= layout.total_bytes, (
++        f"smem region {last_name} [{last_off}, {last_off + last_bytes}) runs "
++        f"past total_bytes={layout.total_bytes}"
++    )
+     assert layout.total_bytes < SM120_SMEM_CARVEOUT_BYTES, (
+         f"smem layout {layout.total_bytes}B exceeds SM120 carveout "
+         f"{SM120_SMEM_CARVEOUT_BYTES}B for model_type={model_type}"
+@@ -549,12 +677,40 @@ def _run_module_asserts() -> None:
+     glm = _assert_model(ModelType.GLM_NSA, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
+     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.ARBITRARY_FP32)
+     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
++    # NVFP4 two-level records (BI*4 kv_sc). fp8_rope is passed EXPLICITLY so the
++    # KV_FP8_ROPE env gate cannot decide what this import-time check covers.
++    _assert_model(
++        ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3, fp8_rope=True
++    )
++    _assert_model(
++        ModelType.GLM_NSA,
++        ComputeMode.BF16,
++        ScaleFormat.NVFP4_E4M3,
++        fp8_rope=True,
++        latent_scale_per_token=True,
++    )
++    # GLM-5.3-Flash NoPE (d_rope == 0): validates that the rope-less layout has
++    # no zero-width q_rope/kv_rope aliasing q_fp8/mbar, in BOTH the 288B and the
++    # 304B (per-token latent scale) cache variants.
++    nope = _assert_model(ModelType.GLM_NOPE, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
++    nope_pts = _assert_model(
++        ModelType.GLM_NOPE,
++        ComputeMode.BF16,
++        ScaleFormat.NVFP4_E4M3,
++        latent_scale_per_token=True,
++    )
+     # Sanity on the expected magnitudes (~92KB DSV4, ~96KB GLM after the
+-    # double-buffered KV + footer + w_fp8 refinements).
++    # double-buffered KV + footer + w_fp8 refinements). NoPE drops the two rope
++    # regions (2KB Q + 16KB KV) and lands near ~59KB.
+     assert 80 * 1024 <= dsv4 <= 96 * 1024, f"DSV4 smem {dsv4}B outside ~92KB band"
+     assert 88 * 1024 <= glm <= SM120_SMEM_CARVEOUT_BYTES, (
+         f"GLM smem {glm}B outside ~96KB band"
+     )
++    assert 48 * 1024 <= nope <= 72 * 1024, f"GLM_NOPE smem {nope}B outside ~59KB band"
++    assert nope_pts == nope + 2 * 64 * 4, (
++        f"GLM_NOPE per-token latent scale must add exactly BI*4 per buffer: "
++        f"{nope_pts} vs {nope}"
++    )
+ 
+ 
+ _run_module_asserts()

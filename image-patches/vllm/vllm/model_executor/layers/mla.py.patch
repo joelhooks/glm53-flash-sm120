@@ -1,0 +1,336 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.py
+index 2bc927ebc..c016b0bb7 100644
+--- a/vllm/model_executor/layers/mla.py
++++ b/vllm/model_executor/layers/mla.py
+@@ -16,11 +16,14 @@ from vllm.model_executor.layers.mla_cache_format import (
+     NVFP4_MLA_SCALES_ENV,
+ )
+ from vllm.model_executor.layers.quantization import QuantizationConfig
++from vllm.models.common.ops import fused_q_kv_rmsnorm
+ from vllm.platforms import current_platform
+ 
+ _NVFP4_MLA_SCALES_ENV = NVFP4_MLA_SCALES_ENV
+-_NVFP4_MLA_SCALES_FORMAT = "nvfp4_ds_mla_outer_scale_v1"
+-_NVFP4_MLA_NUM_LAYERS = 78
++_NVFP4_MLA_SCALES_FORMAT_V1 = "nvfp4_ds_mla_outer_scale_v1"
++_NVFP4_MLA_SCALES_FORMAT_V2 = "nvfp4_ds_mla_outer_scale_v2"
++_NVFP4_MLA_SCALE_POLICY_AMAX = "amax_over_denominator"
++_NVFP4_MLA_SCALE_POLICY_POWER2 = "power_of_two_ceil_amax_over_denominator"
+ _NVFP4_MLA_LATENT_DIM = 512
+ _NVFP4_MLA_SCALE_DENOMINATOR = 6.0 * 448.0
+ _NVFP4_MLA_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+@@ -30,6 +33,64 @@ _KV_FP8_ROPE_ENABLED = NVFP4_MLA_CACHE_FORMAT.fp8_rope
+ _IS_GLM_MOE_DSA_CACHE: bool | None = None
+ 
+ 
++def _current_nvfp4_mla_scale_layout() -> tuple[int, tuple[int, ...]] | None:
++    """Return the cache-layer depth and MLA-bearing layers for the active model.
++
++    GLM-5.2 has MLA on every decoder layer. GLM-5.3 is hybrid: only
++    ``deepseek_sparse_attention`` layers own an MLA KV cache, while its
++    ``linear_attention`` layers must retain identity scale entries. Returning
++    ``None`` preserves validation of legacy artifacts in tooling processes that
++    genuinely have no active vLLM model configuration.
++    """
++    try:
++        vllm_config = get_current_vllm_config()
++    except Exception:
++        return None
++    model_config = getattr(vllm_config, "model_config", None)
++    if model_config is None:
++        return None
++    text_config = getattr(model_config, "hf_text_config", None)
++    if text_config is None:
++        text_config = getattr(model_config, "hf_config", None)
++    if text_config is None:
++        return None
++    num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
++    if type(num_hidden_layers) is not int or num_hidden_layers <= 0:
++        return None
++    num_mtp_layers = getattr(text_config, "num_nextn_predict_layers", 0)
++    if type(num_mtp_layers) is not int or num_mtp_layers < 0:
++        raise ValueError(
++            "active model num_nextn_predict_layers must be a nonnegative integer "
++            "for NVFP4 MLA scale validation"
++        )
++    num_cache_layers = num_hidden_layers + num_mtp_layers
++    layer_types = getattr(text_config, "layer_types", None)
++    if layer_types is None:
++        return num_cache_layers, tuple(range(num_cache_layers))
++    if (
++        not isinstance(layer_types, (list, tuple))
++        or len(layer_types) < num_hidden_layers
++    ):
++        raise ValueError(
++            "active model layer_types must cover every decoder layer for "
++            "NVFP4 MLA scale validation"
++        )
++    backbone_mla_layers = tuple(
++        layer_idx
++        for layer_idx, layer_type in enumerate(layer_types[:num_hidden_layers])
++        if layer_type == "deepseek_sparse_attention"
++    )
++    if not backbone_mla_layers:
++        # Other MLA architectures may expose layer_types using a different
++        # vocabulary. Their established all-layer scale banks remain valid.
++        backbone_mla_layers = tuple(range(num_hidden_layers))
++    # GLM MTP decoder blocks are always constructed as MLA layers after the
++    # target backbone. They own distinct KV records and therefore require
++    # independently calibrated entries in the same absolute-index scale bank.
++    mtp_mla_layers = tuple(range(num_hidden_layers, num_cache_layers))
++    return num_cache_layers, backbone_mla_layers + mtp_mla_layers
++
++
+ def _is_glm_moe_dsa_model() -> bool:
+     # Robust to being called before the vLLM config context is established
+     # (cudagraph compilation in a worker): fall back to the explicit request and
+@@ -67,15 +128,34 @@ def _load_nvfp4_mla_outer_scales(path: str) -> tuple[float, ...]:
+         payload = json.load(handle)
+     if not isinstance(payload, dict):
+         raise ValueError(f"{_NVFP4_MLA_SCALES_ENV} must contain a JSON object")
+-    if payload.get("format") != _NVFP4_MLA_SCALES_FORMAT:
++    scale_format = payload.get("format")
++    if scale_format not in {
++        _NVFP4_MLA_SCALES_FORMAT_V1,
++        _NVFP4_MLA_SCALES_FORMAT_V2,
++    }:
+         raise ValueError(
+             f"{_NVFP4_MLA_SCALES_ENV} has unsupported format {payload.get('format')!r}"
+         )
+-    if type(payload.get("num_layers")) is not int or (
+-        payload["num_layers"] != _NVFP4_MLA_NUM_LAYERS
+-    ):
++    default_policy = (
++        _NVFP4_MLA_SCALE_POLICY_AMAX
++        if scale_format == _NVFP4_MLA_SCALES_FORMAT_V1
++        else None
++    )
++    scale_policy = payload.get("scale_policy", default_policy)
++    allowed_policy = (
++        {_NVFP4_MLA_SCALE_POLICY_AMAX}
++        if scale_format == _NVFP4_MLA_SCALES_FORMAT_V1
++        else {_NVFP4_MLA_SCALE_POLICY_POWER2}
++    )
++    if scale_policy not in allowed_policy:
++        raise ValueError(
++            f"{_NVFP4_MLA_SCALES_ENV} format {scale_format!r} has unsupported "
++            f"scale_policy {scale_policy!r}"
++        )
++    num_layers = payload.get("num_layers")
++    if type(num_layers) is not int or num_layers <= 0:
+         raise ValueError(
+-            f"{_NVFP4_MLA_SCALES_ENV} must declare num_layers={_NVFP4_MLA_NUM_LAYERS}"
++            f"{_NVFP4_MLA_SCALES_ENV} must declare a positive integer num_layers"
+         )
+     if type(payload.get("latent_dim")) is not int or (
+         payload["latent_dim"] != _NVFP4_MLA_LATENT_DIM
+@@ -104,13 +184,113 @@ def _load_nvfp4_mla_outer_scales(path: str) -> tuple[float, ...]:
+     ):
+         raise ValueError(f"{_NVFP4_MLA_SCALES_ENV} scales must be JSON numbers")
+     scales = tuple(float(value) for value in raw_scales)
+-    if len(scales) != _NVFP4_MLA_NUM_LAYERS or any(
++    if len(scales) != num_layers or any(
+         not math.isfinite(value) or value <= 0.0 for value in scales
+     ):
+         raise ValueError(
+             f"{_NVFP4_MLA_SCALES_ENV} must contain exactly "
+-            f"{_NVFP4_MLA_NUM_LAYERS} finite positive scales"
++            f"{num_layers} finite positive scales"
++        )
++
++    layout = _current_nvfp4_mla_scale_layout()
++    expected_indices: tuple[int, ...] | None = None
++    if layout is not None:
++        expected_num_layers, expected_indices = layout
++        if num_layers != expected_num_layers:
++            raise ValueError(
++                f"{_NVFP4_MLA_SCALES_ENV} declares num_layers={num_layers}, but "
++                f"the active model has {expected_num_layers} cache layers"
++            )
++
++    raw_indices = payload.get("calibrated_layer_indices")
++    if raw_indices is None:
++        if expected_indices is not None and expected_indices != tuple(
++            range(num_layers)
++        ):
++            raise ValueError(
++                f"{_NVFP4_MLA_SCALES_ENV} must declare calibrated_layer_indices "
++                "for a hybrid-attention model"
++            )
++        calibrated_indices = tuple(range(num_layers))
++    else:
++        if not isinstance(raw_indices, list) or any(
++            type(layer_idx) is not int for layer_idx in raw_indices
++        ):
++            raise ValueError(
++                f"{_NVFP4_MLA_SCALES_ENV} calibrated_layer_indices must be an "
++                "integer list"
++            )
++        calibrated_indices = tuple(raw_indices)
++        if (
++            not calibrated_indices
++            or calibrated_indices != tuple(sorted(set(calibrated_indices)))
++            or calibrated_indices[0] < 0
++            or calibrated_indices[-1] >= num_layers
++        ):
++            raise ValueError(
++                f"{_NVFP4_MLA_SCALES_ENV} calibrated_layer_indices must be "
++                "nonempty, unique, sorted, and in range"
++            )
++        if expected_indices is not None and calibrated_indices != expected_indices:
++            raise ValueError(
++                f"{_NVFP4_MLA_SCALES_ENV} calibrated_layer_indices do not match "
++                f"the active model MLA layers {list(expected_indices)}"
++            )
++
++    calibrated_set = frozenset(calibrated_indices)
++    non_mla_layers = (
++        layer_idx for layer_idx in range(num_layers) if layer_idx not in calibrated_set
++    )
++    if any(scales[layer_idx] != 1.0 for layer_idx in non_mla_layers):
++        raise ValueError(
++            f"{_NVFP4_MLA_SCALES_ENV} non-MLA layers must use identity scale 1.0"
+         )
++
++    if raw_indices is not None:
++        raw_max_abs = payload.get("max_abs")
++        if (
++            not isinstance(raw_max_abs, list)
++            or len(raw_max_abs) != num_layers
++            or any(
++                isinstance(value, bool) or not isinstance(value, (int, float))
++                for value in raw_max_abs
++            )
++        ):
++            raise ValueError(
++                f"{_NVFP4_MLA_SCALES_ENV} hybrid scale banks must contain one "
++                "numeric max_abs entry per decoder layer"
++            )
++        max_abs = tuple(float(value) for value in raw_max_abs)
++        if any(not math.isfinite(value) or value < 0.0 for value in max_abs):
++            raise ValueError(
++                f"{_NVFP4_MLA_SCALES_ENV} max_abs entries must be finite and "
++                "nonnegative"
++            )
++        for layer_idx in range(num_layers):
++            if layer_idx in calibrated_set:
++                if max_abs[layer_idx] <= 0.0:
++                    raise ValueError(
++                        f"{_NVFP4_MLA_SCALES_ENV} layer {layer_idx} must have "
++                        "positive max_abs"
++                    )
++                raw_expected_scale = max_abs[layer_idx] / _NVFP4_MLA_SCALE_DENOMINATOR
++                expected_scale = raw_expected_scale
++                if scale_policy == _NVFP4_MLA_SCALE_POLICY_POWER2:
++                    expected_scale = math.ldexp(
++                        1.0, math.ceil(math.log2(raw_expected_scale))
++                    )
++                if not math.isclose(
++                    scales[layer_idx], expected_scale, rel_tol=1e-12, abs_tol=0.0
++                ):
++                    raise ValueError(
++                        f"{_NVFP4_MLA_SCALES_ENV} layer {layer_idx} scale is not "
++                        f"consistent with scale_policy {scale_policy!r}"
++                    )
++            elif max_abs[layer_idx] != 0.0:
++                raise ValueError(
++                    f"{_NVFP4_MLA_SCALES_ENV} non-MLA layer {layer_idx} must use "
++                    "max_abs 0.0"
++                )
+     return scales
+ 
+ 
+@@ -120,7 +300,7 @@ class MLAModules:
+ 
+     kv_a_layernorm: torch.nn.Module
+     kv_b_proj: torch.nn.Module
+-    rotary_emb: torch.nn.Module
++    rotary_emb: torch.nn.Module | None
+     o_proj: torch.nn.Module
+     fused_qkv_a_proj: torch.nn.Module | None
+     kv_a_proj_with_mqa: torch.nn.Module | None
+@@ -172,6 +352,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+         skip_topk: bool = False,
+         non_causal_multi_token_decode: bool = False,
+         allow_short_prefill_indexer_scoring_skip: bool = False,
++        fuse_qkv_rmsnorm: bool = False,
+     ) -> None:
+         super().__init__()
+         self.hidden_size = hidden_size
+@@ -201,6 +382,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+         # the topk_tokens buffer written by a previous layer in the same pass.
+         # Refer: https://arxiv.org/abs/2603.12201 for more details.
+         self.skip_topk = skip_topk
++        # When True, fuse the q_a and kv_a RMSNorms into a single kernel launch
++        # (MLA layers with q-LoRA). Opt-in; default False preserves other models.
++        self.fuse_qkv_rmsnorm = fuse_qkv_rmsnorm
+         # qrep is active when the query projection is a DCP-group-sharded layer
+         # that materializes the full group head set locally.
+         q_proj_layer = self.q_b_proj if self.q_lora_rank is not None else self.q_proj
+@@ -268,15 +452,17 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+                     f"Cannot derive decoder layer index from MLA prefix {prefix!r}"
+                 )
+             layer_idx = int(match.group(1))
+-            # Layers 0..77 are the calibrated main decoder stack. Higher indices
+-            # (e.g. the MTP / draft layer 78 under speculative decode) are NOT in
+-            # the calibration set and keep s_l=1.0 (identity) rather than raising.
+-            # That layer is deep/late (not underflowing) and its KV is transient,
+-            # so identity there is a safe no-op for KLD.
+-            if 0 <= layer_idx < _NVFP4_MLA_NUM_LAYERS:
+-                self._nvfp4_mla_outer_scale = _load_nvfp4_mla_outer_scales(scale_file)[
+-                    layer_idx
+-                ]
++            # The scale bank is indexed by the target/MTP decoder's absolute
++            # layer number. Its hybrid-attention layout and identity entries
++            # have already been checked against the active model configuration.
++            scales = _load_nvfp4_mla_outer_scales(scale_file)
++            if 0 <= layer_idx < len(scales):
++                self._nvfp4_mla_outer_scale = scales[layer_idx]
++            else:
++                raise ValueError(
++                    f"MLA layer {layer_idx} is outside the calibrated scale bank "
++                    f"with {len(scales)} layers"
++                )
+         # forward_mqa receives this MLAAttention object as ``layer``.  Keep a
+         # host float here so no device .item() or per-call scale tensor is needed.
+         self.mla_attn._nvfp4_mla_outer_scale = self._nvfp4_mla_outer_scale
+@@ -321,8 +507,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                 dim=-1,
+             )
+-            q_c = self.q_a_layernorm(q_c)
+             q_proj_layer = self.q_b_proj
++            if not self.fuse_qkv_rmsnorm:
++                q_c = self.q_a_layernorm(q_c)
+             q_proj_input = q_c
+         else:
+             assert self.kv_a_proj_with_mqa is not None, (
+@@ -336,7 +523,20 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+             q_proj_input = hidden_states
+ 
+         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+-        kv_c_normed = self.kv_a_layernorm(kv_c)
++        if self.fuse_qkv_rmsnorm and q_c is not None:
++            # Fuse q_a + kv_a RMSNorm into one kernel launch (q_c is still the
++            # pre-norm projection output here).
++            assert self.q_a_layernorm is not None
++            q_proj_input, kv_c_normed = fused_q_kv_rmsnorm(
++                q_c,
++                kv_c,
++                self.q_a_layernorm.weight.data,
++                self.kv_a_layernorm.weight.data,
++                self.q_a_layernorm.variance_epsilon,
++            )
++            q_c = q_proj_input
++        else:
++            kv_c_normed = self.kv_a_layernorm(kv_c)
+         # Normalize only the 512-D compressed latent before the cache writer.
+         # k_pe is a separate 64-D BF16 tensor and remains bit-for-bit unscaled.
+         kv_c_for_cache = kv_c_normed

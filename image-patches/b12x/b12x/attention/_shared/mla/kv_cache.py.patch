@@ -1,0 +1,313 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/b12x/attention/_shared/mla/kv_cache.py b/b12x/attention/_shared/mla/kv_cache.py
+index feaf7ad..f8f1583 100644
+--- a/b12x/attention/_shared/mla/kv_cache.py
++++ b/b12x/attention/_shared/mla/kv_cache.py
+@@ -158,7 +158,7 @@ def _bf16x2_to_f32x2(bf2: Uint32, *, loc=None, ip=None):
+ 
+ 
+ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
+-    """Per-token KV_FP8_ROPE=1 nvfp4_ds_mla record writer.
++    """Per-token GLM-family nvfp4_ds_mla record writer.
+ 
+     Thread mapping (128 threads/CTA): threads 0-31 quantize one 16-dim
+     group each (eight coherent 32-bit loads -> exact f32 promote -> E2M1
+@@ -166,10 +166,17 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
+     32 quantizes the RoPE lane to E4M3 with one fp32 per-token scale.
+     """
+ 
+-    def __init__(self, block_size: int, is_bf16: bool, per_token_scale: bool = False):
++    def __init__(
++        self,
++        block_size: int,
++        is_bf16: bool,
++        per_token_scale: bool = False,
++        no_rope: bool = False,
++    ):
+         self.block_size = int(block_size)
+         self.is_bf16 = bool(is_bf16)
+         self.per_token_scale = bool(per_token_scale)
++        self.no_rope = bool(no_rope)
+ 
+     @cute.jit
+     def __call__(
+@@ -269,7 +276,12 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
+                     token_amax = fmax_f32(token_amax, tmp)
+                     latent_scale = token_amax * Float32(_TWO_LEVEL_RCP)
+                     if tid == Int32(0):
+-                        st_global_f32(dst + Int64(_LATENT_SCALE_OFFSET), latent_scale)
++                        latent_scale_offset = (
++                            _ROPE_SCALE_OFFSET
++                            if cutlass.const_expr(self.no_rope)
++                            else _LATENT_SCALE_OFFSET
++                        )
++                        st_global_f32(dst + Int64(latent_scale_offset), latent_scale)
+                     scale_u32 = Uint32(0)
+                     packed64 = Uint64(0)
+                     if latent_scale != Float32(0.0):
+@@ -307,65 +319,85 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
+                         cutlass.Uint8(scale_u32 & Uint32(0xFF)),
+                     )
+ 
+-            # --- Zero pad: [292, 304) in static mode; [296, 304) when the
+-            # per-token latent scale occupies [292, 296).
+-            if cutlass.const_expr(self.per_token_scale):
+-                if tid < Int32(_PAD_BYTES - _LATENT_SCALE_BYTES):
+-                    st_global_u8(
+-                        dst + Int64(_PAD_OFFSET + _LATENT_SCALE_BYTES) + tid.to(Int64),
+-                        cutlass.Uint8(0),
+-                    )
++            if cutlass.const_expr(self.no_rope):
++                # Rope-less dynamic record: [288,292) latent scale and
++                # [292,304) zero pad. Static records end exactly at byte 288.
++                if cutlass.const_expr(self.per_token_scale):
++                    if tid < Int32(_PAD_BYTES):
++                        st_global_u8(
++                            dst + Int64(_PAD_OFFSET) + tid.to(Int64),
++                            cutlass.Uint8(0),
++                        )
+             else:
+-                if tid < Int32(_PAD_BYTES):
+-                    st_global_u8(
+-                        dst + Int64(_PAD_OFFSET) + tid.to(Int64),
+-                        cutlass.Uint8(0),
+-                    )
++                # RoPE record: [292,304) pad in static mode; [296,304) when
++                # the per-token latent scale occupies [292,296).
++                if cutlass.const_expr(self.per_token_scale):
++                    if tid < Int32(_PAD_BYTES - _LATENT_SCALE_BYTES):
++                        st_global_u8(
++                            dst
++                            + Int64(_PAD_OFFSET + _LATENT_SCALE_BYTES)
++                            + tid.to(Int64),
++                            cutlass.Uint8(0),
++                        )
++                else:
++                    if tid < Int32(_PAD_BYTES):
++                        st_global_u8(
++                            dst + Int64(_PAD_OFFSET) + tid.to(Int64),
++                            cutlass.Uint8(0),
++                        )
+ 
+             # --- RoPE lane: amax -> fp32 scale at [288, 292) -> satfinite
+             # E4M3 bytes at [304, 368).
+-            if tid == Int32(_NUM_GROUPS):
+-                rope_vals = cute.make_rmem_tensor((_PE_DIM,), Float32)
+-                for i in cutlass.range_constexpr(_PE_DIM // 2):
+-                    pair = _ld_global_u32(
+-                        get_ptr_as_int64(k_pe, token * k_pe_stride + Int32(2 * i))
+-                    )
+-                    if cutlass.const_expr(self.is_bf16):
+-                        f0, f1 = _bf16x2_to_f32x2(pair)
+-                    else:
+-                        f0, f1 = f16x2_to_f32x2(pair)
+-                    rope_vals[2 * i] = f0
+-                    rope_vals[2 * i + 1] = f1
+-                rope_amax = Float32(0.0)
+-                for i in cutlass.range_constexpr(_PE_DIM):
+-                    rope_amax = fmax_f32(rope_amax, fabs_f32(rope_vals[i]))
+-                rope_scale = rope_amax * Float32(_E4M3_MAX_RCP)
+-                st_global_f32(dst + Int64(_ROPE_SCALE_OFFSET), rope_scale)
+-                for w in cutlass.range_constexpr(_PE_DIM // 8):
+-                    q8 = Uint64(0)
+-                    if rope_scale != Float32(0.0):
+-                        inv = rcp_approx_ftz(rope_scale)
+-                        lo = cvt_f32x4_to_e4m3x4(
+-                            rope_vals[8 * w + 0] * inv,
+-                            rope_vals[8 * w + 1] * inv,
+-                            rope_vals[8 * w + 2] * inv,
+-                            rope_vals[8 * w + 3] * inv,
+-                        )
+-                        hi = cvt_f32x4_to_e4m3x4(
+-                            rope_vals[8 * w + 4] * inv,
+-                            rope_vals[8 * w + 5] * inv,
+-                            rope_vals[8 * w + 6] * inv,
+-                            rope_vals[8 * w + 7] * inv,
++            if cutlass.const_expr(not self.no_rope):
++                if tid == Int32(_NUM_GROUPS):
++                    rope_vals = cute.make_rmem_tensor((_PE_DIM,), Float32)
++                    for i in cutlass.range_constexpr(_PE_DIM // 2):
++                        pair = _ld_global_u32(
++                            get_ptr_as_int64(
++                                k_pe, token * k_pe_stride + Int32(2 * i)
++                            )
+                         )
+-                        q8 = lo.to(Uint64) | (hi.to(Uint64) << Uint64(32))
+-                    st_global_u64(dst + Int64(_ROPE_OFFSET + 8 * w), q8)
++                        if cutlass.const_expr(self.is_bf16):
++                            f0, f1 = _bf16x2_to_f32x2(pair)
++                        else:
++                            f0, f1 = f16x2_to_f32x2(pair)
++                        rope_vals[2 * i] = f0
++                        rope_vals[2 * i + 1] = f1
++                    rope_amax = Float32(0.0)
++                    for i in cutlass.range_constexpr(_PE_DIM):
++                        rope_amax = fmax_f32(rope_amax, fabs_f32(rope_vals[i]))
++                    rope_scale = rope_amax * Float32(_E4M3_MAX_RCP)
++                    st_global_f32(dst + Int64(_ROPE_SCALE_OFFSET), rope_scale)
++                    for w in cutlass.range_constexpr(_PE_DIM // 8):
++                        q8 = Uint64(0)
++                        if rope_scale != Float32(0.0):
++                            inv = rcp_approx_ftz(rope_scale)
++                            lo = cvt_f32x4_to_e4m3x4(
++                                rope_vals[8 * w + 0] * inv,
++                                rope_vals[8 * w + 1] * inv,
++                                rope_vals[8 * w + 2] * inv,
++                                rope_vals[8 * w + 3] * inv,
++                            )
++                            hi = cvt_f32x4_to_e4m3x4(
++                                rope_vals[8 * w + 4] * inv,
++                                rope_vals[8 * w + 5] * inv,
++                                rope_vals[8 * w + 6] * inv,
++                                rope_vals[8 * w + 7] * inv,
++                            )
++                            q8 = lo.to(Uint64) | (hi.to(Uint64) << Uint64(32))
++                        st_global_u64(dst + Int64(_ROPE_OFFSET + 8 * w), q8)
+ 
+ 
+ @lru_cache(maxsize=None)
+ def _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel(
+-    block_size: int, is_bf16: bool, per_token_scale: bool = False
++    block_size: int,
++    is_bf16: bool,
++    per_token_scale: bool = False,
++    no_rope: bool = False,
+ ) -> ConcatAndCacheNvfp4MlaFp8RopeKernel:
+-    return ConcatAndCacheNvfp4MlaFp8RopeKernel(block_size, is_bf16, per_token_scale)
++    return ConcatAndCacheNvfp4MlaFp8RopeKernel(
++        block_size, is_bf16, per_token_scale, no_rope
++    )
+ 
+ 
+ def clear_nvfp4_mla_fp8_rope_kv_cache_kernel_cache() -> None:
+@@ -408,17 +440,22 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
+     block_size = int(kv_cache.shape[1])
+     slot_capacity = int(kv_cache.shape[0]) * block_size
+     is_bf16 = kv_c.dtype == torch.bfloat16
++    no_rope = int(k_pe.shape[1]) == 0
+     kernel = _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel(
+-        block_size, is_bf16, per_token_scale
++        block_size, is_bf16, per_token_scale, no_rope
+     )
+ 
++    # A zero-width DLPack tensor has no usable device pointer. The NoPE
++    # specialization never reads this argument, so provide an aligned alias.
++    k_pe_kernel = kv_c[:, :1] if no_rope else k_pe
++
+     args = (
+         _to_kernel_tensor(kv_c, assumed_align=4, leading_dim=1),
+-        _to_kernel_tensor(k_pe, assumed_align=4, leading_dim=1),
++        _to_kernel_tensor(k_pe_kernel, assumed_align=4, leading_dim=1),
+         _to_kernel_tensor(kv_cache, assumed_align=16, leading_dim=2),
+         _to_kernel_tensor(slot_mapping, assumed_align=8, leading_dim=0),
+         Int32(int(kv_c.stride(0))),
+-        Int32(int(k_pe.stride(0))),
++        Int32(int(k_pe_kernel.stride(0))),
+         Int64(int(kv_cache.stride(0))),
+         Int32(int(kv_cache.stride(1))),
+         Int32(slot_capacity),
+@@ -427,7 +464,9 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
+     )
+     cache_key = (
+         tensor_compile_fact("kv_c", kv_c, dynamic_dims=(0,), dynamic_strides=(0,)),
+-        tensor_compile_fact("k_pe", k_pe, dynamic_dims=(0,), dynamic_strides=(0,)),
++        tensor_compile_fact(
++            "k_pe", k_pe_kernel, dynamic_dims=(0,), dynamic_strides=(0,)
++        ),
+         tensor_compile_fact(
+             "kv_cache",
+             kv_cache,
+@@ -438,12 +477,12 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
+         str(kv_c.dtype),
+         block_size,
+         bool(per_token_scale),
++        bool(no_rope),
+     )
+-    # Version 3: per_token_scale joined the record semantics (fp32 second-level
+-    # scale at [292, 296)); a v2 cubin must never run against v3 records.
++    # Version 4: rope-less 288/304-byte records joined the specialization key.
+     spec = KernelCompileSpec.from_key(
+         "attention.mla.nvfp4_fp8_rope_kv_cache",
+-        3,
++        4,
+         cache_key,
+         labels=(
+             "kv_c",
+@@ -453,6 +492,7 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
+             "kv_dtype",
+             "block_size",
+             "per_token_scale",
++            "no_rope",
+         ),
+     )
+     b12x_launch(
+@@ -498,12 +538,13 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
+     scale: torch.Tensor | None = None,
+     per_token_scale: bool = False,
+ ) -> None:
+-    """Write ``num_tokens`` KV_FP8_ROPE=1 nvfp4_ds_mla records.
++    """Write ``num_tokens`` GLM-family nvfp4_ds_mla records.
+ 
+     :param kv_c: MLA compressed latent, ``(>= num_tokens, 512)`` bf16/f16.
+-    :param k_pe: decoupled RoPE key, ``(>= num_tokens, 64)``, same dtype.
+-    :param kv_cache: paged cache viewed ``(num_blocks, block_size, 368)``
+-        uint8; mutated in place.
++    :param k_pe: decoupled RoPE key, ``(>= num_tokens, 64)``, or a zero-width
++        ``(>= num_tokens, 0)`` tensor for GLM NoPE; same dtype as ``kv_c``.
++    :param kv_cache: paged uint8 cache viewed with a 368-byte RoPE record, or
++        a 288-byte NoPE record (304 bytes with ``per_token_scale``).
+     :param slot_mapping: ``(num_tokens,)`` int64 flat slot ids; entries outside
+         ``[0, num_blocks * block_size)`` are skipped.
+     :param scale: accepted for signature parity with the fp8 cache-op
+@@ -511,7 +552,8 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
+         (group scales carry all magnitude), so it is unused.
+     :param per_token_scale: write inline-scale two-level records: the
+         per-token second-level scale ``token_amax/(6*448)`` is stored fp32 at
+-        record bytes [292, 296) and group scales are encoded relative to it.
++        bytes [292,296) for RoPE or [288,292) for NoPE, and group scales are
++        encoded relative to it.
+         Readers must run in the matching ``latent_scale_per_token`` mode.
+     """
+     del scale
+@@ -519,18 +561,22 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
+         raise ValueError(
+             f"kv_c must be (num_tokens, {_KV_LORA_RANK}), got {tuple(kv_c.shape)}"
+         )
+-    if k_pe.ndim != 2 or int(k_pe.shape[1]) != _PE_DIM:
++    if k_pe.ndim != 2 or int(k_pe.shape[1]) not in (0, _PE_DIM):
+         raise ValueError(
+-            f"k_pe must be (num_tokens, {_PE_DIM}), got {tuple(k_pe.shape)}"
++            f"k_pe must be (num_tokens, 0 or {_PE_DIM}), got {tuple(k_pe.shape)}"
+         )
+     if kv_c.dtype not in (torch.bfloat16, torch.float16):
+         raise TypeError(f"kv_c must be bf16/f16, got {kv_c.dtype}")
+     if k_pe.dtype != kv_c.dtype:
+         raise TypeError(f"k_pe dtype {k_pe.dtype} must match kv_c dtype {kv_c.dtype}")
+-    if kv_cache.ndim != 3 or int(kv_cache.shape[2]) != _RECORD_BYTES:
++    no_rope = int(k_pe.shape[1]) == 0
++    expected_record_bytes = (
++        (304 if per_token_scale else 288) if no_rope else _RECORD_BYTES
++    )
++    if kv_cache.ndim != 3 or int(kv_cache.shape[2]) != expected_record_bytes:
+         raise ValueError(
+             "kv_cache must be (num_blocks, block_size, "
+-            f"{_RECORD_BYTES}) uint8, got {tuple(kv_cache.shape)}"
++            f"{expected_record_bytes}) uint8, got {tuple(kv_cache.shape)}"
+         )
+     if int(kv_cache.shape[0]) <= 0 or int(kv_cache.shape[1]) <= 0:
+         raise ValueError("kv_cache num_blocks and block_size must be positive")
+@@ -556,7 +602,7 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
+     if kv_c.stride(0) % 2 != 0 or kv_c.data_ptr() % 4 != 0:
+         # The group loads are 32-bit (element pairs), same as the CUDA writer.
+         raise ValueError("kv_c rows must be 4-byte aligned (even row stride)")
+-    if k_pe.stride(0) % 2 != 0 or k_pe.data_ptr() % 4 != 0:
++    if not no_rope and (k_pe.stride(0) % 2 != 0 or k_pe.data_ptr() % 4 != 0):
+         raise ValueError("k_pe rows must be 4-byte aligned (even row stride)")
+     if (
+         kv_cache.data_ptr() % 16 != 0

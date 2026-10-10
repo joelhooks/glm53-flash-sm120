@@ -1,0 +1,69 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/tool_parsers/test_structural_tag_registry.py b/tests/tool_parsers/test_structural_tag_registry.py
+index b84dfad09..d56c7c69b 100644
+--- a/tests/tool_parsers/test_structural_tag_registry.py
++++ b/tests/tool_parsers/test_structural_tag_registry.py
+@@ -473,13 +473,56 @@ def test_unified_parser_get_structural_tag_disables_reasoning(
+         tool_choice="auto",
+     )
+     parser = TestParser(MagicMock(), tools=sample_tools_strict)
+-    parser.reasoning_parser = MagicMock(adjust_request=lambda request: request)
++    parser.reasoning_parser = MagicMock(
++        thinking_enabled=False,
++        adjust_request=lambda request: request,
++    )
+ 
+     parser.adjust_request(request)
+ 
+     assert captured == [False]
+ 
+ 
++@pytest.mark.parametrize(
++    ("reasoning_enabled", "expected_grammar_from_parser"),
++    [(False, False), (True, True)],
++)
++def test_unified_parser_activates_reasoning_aware_grammar_at_token_zero(
++    sample_tools_strict: list[ChatCompletionToolsParam],
++    reasoning_enabled: bool,
++    expected_grammar_from_parser: bool,
++):
++    class TestParser(DelegatingParser):
++        pass
++
++    request = ChatCompletionRequest(
++        messages=[],
++        model="m",
++        tools=sample_tools_strict,
++        tool_choice="required",
++    )
++    reasoning_parser = MagicMock()
++    reasoning_parser.thinking_enabled = reasoning_enabled
++    reasoning_parser.adjust_request.side_effect = lambda request: request
++    tool_parser = MagicMock()
++    tool_parser.structural_tag_model = "deepseek_v4"
++    tool_parser.get_structural_tag.return_value = SimpleNamespace(
++        model_dump=lambda: {"type": "structural_tag"}
++    )
++    tool_parser.adjust_request.side_effect = lambda request: request
++
++    parser = TestParser(MagicMock())
++    parser.reasoning_parser = reasoning_parser
++    parser.tool_parser = tool_parser
++
++    result = parser.adjust_request(request)
++
++    assert result._grammar_from_parser is expected_grammar_from_parser
++    tool_parser.get_structural_tag.assert_called_once_with(
++        request, reasoning=reasoning_enabled
++    )
++
++
+ def test_xgrammar_function_parameters_are_preserved(
+     monkeypatch: pytest.MonkeyPatch,
+     sample_tools_strict: list[ChatCompletionToolsParam],

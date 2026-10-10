@@ -1,0 +1,48 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/parser/engine/test_deepseek_v4.py b/tests/parser/engine/test_deepseek_v4.py
+index ba5ebf76e..703b59634 100644
+--- a/tests/parser/engine/test_deepseek_v4.py
++++ b/tests/parser/engine/test_deepseek_v4.py
+@@ -231,6 +231,36 @@ class TestMissingInvokeEnd:
+         assert "Done." in collect_content(results)
+ 
+ 
++class TestToolEndAbsorption:
++    def test_duplicate_tool_end_is_not_streamed_as_content(
++        self, mock_tokenizer, mock_request
++    ):
++        parser = DeepSeekV4Parser(mock_tokenizer)
++        chunks = [
++            DSML_TOOL_START,
++            DSML_INVOKE_PREFIX
++            + "get_weather"
++            + DSML_INVOKE_NAME_END
++            + "\n"
++            + _param("location", "true", "NYC")
++            + "\n"
++            + DSML_INVOKE_END
++            + "\n</",
++            DSML_TOOL_END.removeprefix("</") + "</",
++            DSML_TOOL_END.removeprefix("</") + "</think>",
++            "Done.",
++        ]
++
++        results = simulate_tool_streaming(parser, mock_request, chunks)
++
++        assert collect_function_name(results) == "get_weather"
++        assert json.loads(collect_tool_arguments(results)) == {"location": "NYC"}
++        content = collect_content(results)
++        assert content == "Done."
++        assert "DSML" not in content
++        assert "</think>" not in content
++
++
+ # ── Thinking mode initial state ──────────────────────────────────────
+ 
+ 

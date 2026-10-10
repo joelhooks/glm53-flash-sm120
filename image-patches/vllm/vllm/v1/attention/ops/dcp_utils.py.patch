@@ -1,0 +1,210 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/attention/ops/dcp_utils.py b/vllm/v1/attention/ops/dcp_utils.py
+index b28d337a1..e47a06448 100644
+--- a/vllm/v1/attention/ops/dcp_utils.py
++++ b/vllm/v1/attention/ops/dcp_utils.py
+@@ -614,24 +614,56 @@ class MLADCPManager:
+         self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
+         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
+         self.padded_num_heads = padded_num_heads
+-
+-        self.combine = self._init_combine(
++        self._combine_args = (
+             num_heads,
+             output_head_dim,
+             output_dtype,
+             is_lse_base_on_e,
+             use_pcp,
+         )
++        self._query_gather_args = (
++            num_heads,
++            query_head_dim,
++            query_dtype,
++        )
++        self._use_pcp = use_pcp
++        self._configure_collectives(allow_direct=self.device.type != "meta")
++
++    def _configure_collectives(self, *, allow_direct: bool) -> None:
++        self.combine = self._init_combine(
++            *self._combine_args,
++            allow_direct=allow_direct,
++        )
+         self.query_gather = (
+             None
+-            if use_pcp
++            if self._use_pcp
+             else self._init_query_gather(
+-                num_heads,
+-                query_head_dim,
+-                query_dtype,
++                *self._query_gather_args,
++                allow_direct=allow_direct,
+             )
+         )
+ 
++    def materialize(self, device: torch.device) -> None:
++        """Allocate direct collective workspaces after weights reach a device.
++
++        InstantTensor constructs model layers on the meta device. Symmetric
++        memory requires a physical CUDA device, so direct workspaces must be
++        selected only after model loading has materialized the layer weights.
++        """
++        device = torch.device(device)
++        if device.type == "meta":
++            return
++        if self.device.type != "meta":
++            if self.device != device:
++                raise RuntimeError(
++                    "MLA DCP collectives are already materialized on "
++                    f"{self.device}, but the layer weights are on {device}."
++                )
++            return
++
++        self.device = device
++        self._configure_collectives(allow_direct=True)
++
+     def _init_combine(
+         self,
+         num_heads: int,
+@@ -639,9 +671,24 @@ class MLADCPManager:
+         dtype: torch.dtype,
+         is_lse_base_on_e: bool,
+         use_pcp: bool,
++        *,
++        allow_direct: bool = True,
+     ) -> DCPCombine:
++        combine_fn = (
++            dcp_a2a_lse_reduce
++            if self.use_a2a
++            else cp_lse_ag_out_ar
++            if use_pcp
++            else cp_lse_ag_out_rs
++        )
++        fallback_combine = functools.partial(
++            combine_fn,
++            cp_group=self.group,
++            is_lse_base_on_e=is_lse_base_on_e,
++        )
++
+         direct_workspace = None
+-        if self.use_a2a:
++        if self.use_a2a and allow_direct:
+             direct_workspace = get_direct_dcp_a2a_workspace(
+                 self.group,
+                 self.device,
+@@ -654,21 +701,45 @@ class MLADCPManager:
+         if direct_workspace is not None:
+             logger.info_once("Using direct symmetric-memory DCP A2A for MLA.")
+             return functools.partial(
+-                direct_workspace.lse_reduce,
++                self._direct_combine_with_capacity_fallback,
++                direct_workspace=direct_workspace,
++                fallback_combine=fallback_combine,
+                 is_lse_base_on_e=is_lse_base_on_e,
+             )
++        return fallback_combine
+ 
+-        combine_fn = (
+-            dcp_a2a_lse_reduce
+-            if self.use_a2a
+-            else cp_lse_ag_out_ar
+-            if use_pcp
+-            else cp_lse_ag_out_rs
+-        )
+-        return functools.partial(
+-            combine_fn,
+-            cp_group=self.group,
+-            is_lse_base_on_e=is_lse_base_on_e,
++    def _direct_combine_with_capacity_fallback(
++        self,
++        partial_output: torch.Tensor,
++        partial_lse: torch.Tensor,
++        *,
++        seq_lens: torch.Tensor,
++        query_start_loc: torch.Tensor,
++        direct_workspace: DirectDCPA2AWorkspace,
++        fallback_combine: DCPCombine,
++        is_lse_base_on_e: bool,
++    ) -> torch.Tensor:
++        """Use the small direct workspace for decode and NCCL for large prefill.
++
++        ``get_dcp_workspace_max_num_tokens`` intentionally sizes direct
++        symmetric memory for decode/spec-decode rows, which is far smaller than
++        ``max_num_batched_tokens``. Sparse MLA also invokes the same combine for
++        chunked prefill. Route those larger, shape-static calls through the
++        ordinary A2A collective instead of overrunning the decode workspace.
++        """
++        if partial_output.shape[0] <= self.max_num_tokens:
++            return direct_workspace.lse_reduce(
++                partial_output,
++                partial_lse,
++                seq_lens=seq_lens,
++                query_start_loc=query_start_loc,
++                is_lse_base_on_e=is_lse_base_on_e,
++            )
++        return fallback_combine(
++            partial_output,
++            partial_lse,
++            seq_lens=seq_lens,
++            query_start_loc=query_start_loc,
+         )
+ 
+     def _init_query_gather(
+@@ -676,22 +747,41 @@ class MLADCPManager:
+         num_heads: int,
+         head_dim: int,
+         dtype: torch.dtype,
++        *,
++        allow_direct: bool = True,
+     ) -> Callable[[torch.Tensor], torch.Tensor]:
+-        direct_workspace = get_direct_dcp_q_gather_workspace(
+-            self.group,
+-            self.device,
+-            self.max_num_tokens,
+-            num_heads,
+-            head_dim,
+-            dtype,
+-            self.num_ubatches,
+-            self.padded_num_heads,
++        direct_workspace = (
++            get_direct_dcp_q_gather_workspace(
++                self.group,
++                self.device,
++                self.max_num_tokens,
++                num_heads,
++                head_dim,
++                dtype,
++                self.num_ubatches,
++                self.padded_num_heads,
++            )
++            if allow_direct
++            else None
+         )
+         if direct_workspace is not None:
+             logger.info_once("Using direct symmetric-memory DCP query gather for MLA.")
+-            return direct_workspace.gather
++            return functools.partial(
++                self._direct_query_gather_with_capacity_fallback,
++                direct_workspace=direct_workspace,
++            )
+         return self._gather_query
+ 
++    def _direct_query_gather_with_capacity_fallback(
++        self,
++        query: torch.Tensor,
++        *,
++        direct_workspace: DirectDCPQGatherWorkspace,
++    ) -> torch.Tensor:
++        if query.shape[0] <= self.max_num_tokens:
++            return direct_workspace.gather(query)
++        return self._gather_query(query)
++
+     def _gather_query(self, query: torch.Tensor) -> torch.Tensor:
+         query = self.group.all_gather(query, dim=1)
+         if self.padded_num_heads is not None:

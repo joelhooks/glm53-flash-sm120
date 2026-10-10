@@ -1,0 +1,62 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/b12x/attention/_shared/mla/prefill.py b/b12x/attention/_shared/mla/prefill.py
+index aeefc42..63578ad 100644
+--- a/b12x/attention/_shared/mla/prefill.py
++++ b/b12x/attention/_shared/mla/prefill.py
+@@ -51,14 +51,15 @@ def _cache_block_stride_bytes(
+         COMPRESSED_MLA_BYTES_PER_TOKEN,
+     )
+ 
+-    if model_type == ModelType.GLM_NSA:
+-        # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
+-        # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
++    if model_type in (ModelType.GLM_NSA, ModelType.GLM_NOPE):
++        # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32), 432B
++        # or 368B (GLM_NSA NVFP4), 288B or 304B (GLM_NOPE NVFP4).
++        # ``record_bytes`` comes from traits.kv_gmem_stride.
+         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
+         expected = int(page_size) * rec
+     else:
+         expected = int(page_size) * COMPRESSED_MLA_BYTES_PER_TOKEN
+-    if model_type == ModelType.GLM_NSA and cache.is_contiguous():
++    if model_type in (ModelType.GLM_NSA, ModelType.GLM_NOPE) and cache.is_contiguous():
+         return expected
+     # The runtime page stride is part of the packed/padded cache contract.
+     if cache.ndim >= 2:
+@@ -179,7 +180,13 @@ def run_unified_prefill(
+         )
+ 
+     model_type, compute_mode, inferred_scale_format = infer_model_type(
+-        q_head_dim, kv_cache.dtype
++        q_head_dim,
++        kv_cache.dtype,
++        # Only a byte-typed cache has a byte-meaningful trailing extent; that
++        # extent is what separates GLM_NOPE from DSV4 at q_head_dim == 512.
++        kv_record_bytes=(
++            int(kv_cache.shape[-1]) if kv_cache.dtype.itemsize == 1 else None
++        ),
+     )
+     if scale_format is None:
+         scale_format = inferred_scale_format
+@@ -361,13 +368,13 @@ def run_unified_prefill(
+     _mg_nvfp4 = (
+         _mg_enabled
+         and not has_extra
+-        and model_type == ModelType.GLM_NSA
++        and model_type in (ModelType.GLM_NSA, ModelType.GLM_NOPE)
+         and scale_format == ScaleFormat.NVFP4_E4M3
+     )
+     if _mg_nvfp4 and topk in (128, 512, 1024, 2048):
+         return _run_partitioned_mg(
+             compute_mode=ComputeMode.BF16,
+-            model_type=ModelType.GLM_NSA,
++            model_type=model_type,
+             scale_format=ScaleFormat.NVFP4_E4M3,
+         )
+     _mg_base = (

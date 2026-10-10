@@ -1,0 +1,107 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/serve-ds4-flash.sh b/serve-ds4-flash.sh
+index ea2e218e3..bd93e4bd0 100755
+--- a/serve-ds4-flash.sh
++++ b/serve-ds4-flash.sh
+@@ -182,11 +182,7 @@ export VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=${VLLM_MULTI_STREAM_GEMM_TOKEN_THR
+ 
+ allreduce_mode=${ALLREDUCE_MODE:-auto}
+ if [[ "${allreduce_mode}" == "auto" ]]; then
+-  if [[ "${tp_size}" == "2" ]]; then
+-    allreduce_mode=flashinfer-ipc
+-  else
+-    allreduce_mode=b12x
+-  fi
++  allreduce_mode=b12x
+ fi
+ b12x_pcie_dma=$(bool_value B12X_PCIE_DMA "${B12X_PCIE_DMA:-0}")
+ export VLLM_USE_B12X_PCIE_DMA=${b12x_pcie_dma}
+@@ -195,7 +191,7 @@ case "${allreduce_mode}" in
+   b12x)
+     export VLLM_ENABLE_PCIE_ALLREDUCE=1
+     export VLLM_PCIE_ALLREDUCE_BACKEND=b12x
+-    export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE=${VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE:-64KB}
++    export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE=${VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE:-auto}
+     export VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE=0
+     export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+     ;;
+@@ -556,6 +552,60 @@ mkdir -p \
+   "${TORCHINDUCTOR_CACHE_DIR}" "${TORCH_EXTENSIONS_DIR}" \
+   "${FLASHINFER_WORKSPACE_BASE}"
+ 
++plain_allreduce_calibration_status=disabled
++if [[ "${allreduce_mode}" == "b12x" \
++  && "${VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE}" == "auto" \
++  && ( "${tp_size}" == "2" || "${tp_size}" == "4" ) ]]; then
++  plain_allreduce_calibration=${B12X_PCIE_PLAIN_ALLREDUCE_CALIBRATION:-auto}
++  case "${plain_allreduce_calibration}" in auto|force|off) ;; *)
++    echo "B12X_PCIE_PLAIN_ALLREDUCE_CALIBRATION must be auto, force, or off" >&2
++    exit 2
++  esac
++  if [[ -n "${B12X_PCIE_PLAIN_ALLREDUCE_POLICY:-}" ]]; then
++    plain_allreduce_calibration_status=explicit-policy
++  elif [[ "${plain_allreduce_calibration}" == "off" ]]; then
++    plain_allreduce_calibration_status=off
++  elif [[ "$(bool_value DRY_RUN "${DRY_RUN:-0}")" == "1" ]]; then
++    plain_allreduce_calibration_status=skipped:dry-run
++  else
++    calibration_rows=${B12X_PCIE_PLAIN_ALLREDUCE_CALIBRATION_ROWS:-}
++    if [[ -z "${calibration_rows}" ]]; then
++      rows=(1 2 4)
++      if [[ "${tp_size}" == "2" ]]; then
++        row_limit=${graph_cap}
++        if (( row_limit > 512 )); then row_limit=512; fi
++        for (( row=8; row <= row_limit; row+=8 )); do rows+=("${row}"); done
++        if (( graph_cap <= 512 )); then rows+=("${graph_cap}"); fi
++      else
++        for row in 8 16 24 32; do
++          if (( row <= graph_cap )); then rows+=("${row}"); fi
++        done
++      fi
++      calibration_rows=$(printf '%s\n' "${rows[@]}" | sort -n -u | paste -sd, -)
++    fi
++    calibration_cache_dir=${B12X_PCIE_PLAIN_ALLREDUCE_CALIBRATION_CACHE_DIR:-${cache_root}/pcie-plain-allreduce}
++    calibration_timeout=${B12X_PCIE_PLAIN_ALLREDUCE_CALIBRATION_TIMEOUT:-180}
++    force_arg=()
++    if [[ "${plain_allreduce_calibration}" == "force" ]]; then force_arg=(--force); fi
++    if policy=$(python3 -m b12x.comm.pcie.plain_allreduce_calibration \
++      --world-size "${tp_size}" \
++      --hidden-size 4096 \
++      --rows "${calibration_rows}" \
++      --cache-dir "${calibration_cache_dir}" \
++      --timeout "${calibration_timeout}" \
++      "${force_arg[@]}"); then
++      export B12X_PCIE_PLAIN_ALLREDUCE_POLICY=${policy}
++      plain_allreduce_calibration_status=ready
++    else
++      # Preserve the established 64 KiB route when a host cannot run the
++      # startup probe. Explicit operator settings never enter this branch.
++      export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE=64KB
++      plain_allreduce_calibration_status=failed:64KB-fallback
++      echo "WARNING: B12X plain all-reduce calibration failed; using 64KB routing" >&2
++    fi
++  fi
++fi
++
+ command=(
+   vllm serve "${model}"
+   "${revision_args[@]}"
+@@ -603,9 +653,10 @@ if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
+ fi
+ command+=("$@")
+ 
+-printf 'DS4 launch: mode=%s depth=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s native_l2=%s allocator=%s model=%s\n' \
++printf 'DS4 launch: mode=%s depth=%s backend=%s allreduce=%s plain_ar_calibration=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s native_l2=%s allocator=%s model=%s\n' \
+   "${mode}" "${dspark_depth_mode}" \
+-  "${backend}" "${allreduce_mode}" "${b12x_pcie_dma}" \
++  "${backend}" "${allreduce_mode}" "${plain_allreduce_calibration_status}" \
++  "${b12x_pcie_dma}" \
+   "${indexer_backend}" "${tp_size}" "${dcp_size}" "${max_num_seqs}" \
+   "${graph_cap}" "${load_format}" "${INSTANTTENSOR_BACKEND}" \
+   "${native_l2_enabled}" \

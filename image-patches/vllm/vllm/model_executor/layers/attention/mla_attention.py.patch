@@ -1,0 +1,147 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index b92e96a9a..36d02eec8 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -321,6 +321,7 @@ from vllm.v1.kv_cache_interface import (
+     SlidingWindowMLASpec,
+     get_kv_cache_dcp_shard_count,
+     get_kv_quant_mode,
++    get_mla_kv_model_version,
+ )
+ 
+ logger = init_logger(__name__)
+@@ -635,6 +636,30 @@ def _get_kv_b_proj_input_dtype(
+     return weight_dtype
+ 
+ 
++def _get_dcp_batch_metadata(
++    attn_metadata: AttentionMetadata,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Return aligned request lengths and query offsets for MLA DCP merge."""
++    decode_metadata = getattr(attn_metadata, "decode", None)
++    if decode_metadata is not None:
++        num_reqs = attn_metadata.num_decodes  # type: ignore[attr-defined]
++        seq_lens = cast(torch.Tensor, decode_metadata.seq_lens)
++    else:
++        # Sparse MLA routes prefill and decode through one MQA path. Its
++        # metadata therefore describes every request at the top level rather
++        # than exposing a nested decode-only object.
++        num_reqs = attn_metadata.num_reqs  # type: ignore[attr-defined]
++        seq_lens = cast(
++            torch.Tensor, attn_metadata.seq_lens
++        )[  # type: ignore[attr-defined]
++            :num_reqs
++        ]
++    query_start_loc = attn_metadata.query_start_loc[  # type: ignore[attr-defined]
++        : num_reqs + 1
++    ]
++    return seq_lens, query_start_loc
++
++
+ class MLAAttention(nn.Module, AttentionLayerBase):
+     """Multi-Head Latent Attention layer.
+ 
+@@ -649,6 +674,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+     3. Return the output tensor.
+     """
+ 
++    supports_dense_mha_prefill: ClassVar[bool] = True
++
+     def __init__(
+         self,
+         num_heads: int,
+@@ -811,9 +838,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+         compilation_config.static_forward_context[prefix] = self
+ 
+         self.prefill_backend: MLAPrefillBackend | None
+-        if self.impl.is_sparse and not self.impl.supports_dense_mha_prefill:
++        if self.impl.is_sparse and not (
++            self.impl.supports_dense_mha_prefill and self.supports_dense_mha_prefill
++        ):
+             logger.warning_once(
+-                "Sparse MLA impl has no dense-MHA prefill path; using the top-k "
++                "Sparse MLA layer has no dense-MHA prefill path; using the top-k "
+                 "MQA path only."
+             )
+             self.prefill_backend = None
+@@ -1607,16 +1636,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+                         "softmax LSE required by DCP."
+                     )
+                 assert self.dcp_manager is not None
+-                seq_lens = (
+-                    attn_metadata.decode.seq_lens
+-                    if attn_metadata.decode is not None
+-                    else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
+-                        : attn_metadata.num_decodes
+-                    ]
+-                )
+-                query_start_loc = attn_metadata.query_start_loc[
+-                    : attn_metadata.num_decodes + 1
+-                ]
++                seq_lens, query_start_loc = _get_dcp_batch_metadata(attn_metadata)
+                 valid_counts = None
+                 if project_before_merge:
+                     valid_counts_tensor = getattr(
+@@ -2064,6 +2084,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+             set_default_quant_scales(self, register_buffer=False)
+ 
+     def process_weights_after_loading(self, act_dtype: torch.dtype):
++        dcp_manager = getattr(self, "dcp_manager", None)
++        if dcp_manager is not None:
++            dcp_device = _find_linear_weight_device(self.kv_b_proj)
++            if dcp_device is None:
++                raise RuntimeError(
++                    "Cannot determine the device for MLA DCP collective workspaces."
++                )
++            dcp_manager.materialize(dcp_device)
++
+         self._use_b12x_absorb_bmm = self._prepare_b12x_absorb_bmm(act_dtype)
+         self._fused_mla_query_output_dtype = (
+             current_platform.fp8_dtype()
+@@ -2095,7 +2124,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+             num_kv_heads=1,
+             head_size=self.head_size,
+             dtype=kv_cache_dtype,
+-            cache_dtype_str=self.kv_cache_dtype,
++            cache_dtype_str=vllm_config.cache_config.cache_dtype,
++            # Stamp the quant mode so runners don't take the unquantized
++            # ("auto") shape path for quantized layouts like fp8_ds_mla,
++            # whose kernel page layout (656 B/token) differs from
++            # head_size * dtype_size.
+             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+         )
+         if self.sliding_window is not None:
+@@ -2137,10 +2170,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+             and self.kv_cache_dtype == "nvfp4_ds_mla"
+             and glm_model_or_mtp
+         )
++        hf_text_config = vllm_config.model_config.hf_text_config
++        model_version = get_mla_kv_model_version(
++            self.kv_cache_dtype, hf_text_config
++        )
++        if model_version is None and glm_fp8_rope:
++            model_version = "glm_fp8_rope"
+         return MLAAttentionSpec(
+             **common_kwargs,
+             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+-            model_version="glm_fp8_rope" if glm_fp8_rope else None,
++            model_version=model_version,
+             dcp_replicated=dcp_replicated,
+         )
+ 
+@@ -2472,7 +2511,7 @@ class MLACommonBackend(AttentionBackend):
+ 
+     @classmethod
+     def get_supported_head_sizes(cls) -> list[int]:
+-        return [320, 576]
++        return [320, 512, 576]
+ 
+     @classmethod
+     def is_mla(cls) -> bool:

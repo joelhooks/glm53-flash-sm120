@@ -1,0 +1,10 @@
+# Block 1: repro rate, equivalence, control, diagnostics.
+upstream baseline 2 1
+upstream baseline 2 2
+upstream baseline 2 3
+source baseline 2 1
+source baseline 2 2
+source baseline 2 3
+source baseline 1 1
+source debug 2 1
+source memcheck 2 1

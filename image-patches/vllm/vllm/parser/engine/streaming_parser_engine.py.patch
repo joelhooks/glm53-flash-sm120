@@ -1,0 +1,59 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/parser/engine/streaming_parser_engine.py b/vllm/parser/engine/streaming_parser_engine.py
+index 157a1796e..d697665a2 100644
+--- a/vllm/parser/engine/streaming_parser_engine.py
++++ b/vllm/parser/engine/streaming_parser_engine.py
+@@ -264,6 +264,8 @@ class StreamingParserEngine:
+             ParserState.TOOL_ARGS,
+             ParserState.TOOL_NAME,
+             ParserState.TOOL_BETWEEN,
++            ParserState.TOOL_DIRECT_NAME,
++            ParserState.TOOL_DIRECT_ARGS,
+         ):
+             if self.tool_index >= 0:
+                 events.append(
+@@ -314,6 +316,8 @@ class StreamingParserEngine:
+             ParserState.TOOL_NAME,
+             ParserState.TOOL_ARGS,
+             ParserState.TOOL_BETWEEN,
++            ParserState.TOOL_DIRECT_NAME,
++            ParserState.TOOL_DIRECT_ARGS,
+         }
+     )
+ 
+@@ -389,7 +393,7 @@ class StreamingParserEngine:
+         if self.state == ParserState.MESSAGE_HEADER:
+             self._message_header_buffer += text
+             return []
+-        if self.state == ParserState.TOOL_ARGS:
++        if self.state in (ParserState.TOOL_ARGS, ParserState.TOOL_DIRECT_ARGS):
+             if self.config.tool_args_json:
+                 return self._feed_args_text(text)
+             return [
+@@ -419,8 +423,9 @@ class StreamingParserEngine:
+         message_header = ""
+ 
+         if (
+-            self.state == ParserState.TOOL_ARGS
+-            and transition.next_state != ParserState.TOOL_ARGS
++            self.state in (ParserState.TOOL_ARGS, ParserState.TOOL_DIRECT_ARGS)
++            and transition.next_state
++            not in (ParserState.TOOL_ARGS, ParserState.TOOL_DIRECT_ARGS)
+             and self._args_buffer
+         ):
+             events.append(
+@@ -457,7 +462,7 @@ class StreamingParserEngine:
+                 )
+             )
+ 
+-        if self.state == ParserState.TOOL_ARGS:
++        if self.state in (ParserState.TOOL_ARGS, ParserState.TOOL_DIRECT_ARGS):
+             self._args_brace_depth = 0
+             self._args_in_string = False
+             self._args_escape_next = False

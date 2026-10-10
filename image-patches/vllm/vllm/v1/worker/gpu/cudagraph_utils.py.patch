@@ -1,0 +1,242 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 484c72e89..db69eb61a 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import gc
+ import os
+ from collections import defaultdict
+ from collections.abc import Callable
+@@ -21,6 +22,7 @@ from vllm.compilation.breakable_cudagraph import (
+     is_breakable_cudagraph_enabled,
+ )
+ from vllm.compilation.counter import compilation_counter
++from vllm.compilation.cuda_graph import CUDAGraphWrapper
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
+@@ -42,7 +44,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
+ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.model_states.interface import ModelState
+-from vllm.v1.worker.utils import AttentionGroup
++from vllm.v1.worker.utils import AttentionGroup, is_uniform_query_len
+ 
+ logger = init_logger(__name__)
+ 
+@@ -100,17 +102,24 @@ def _is_compatible(
+ 
+ 
+ def get_uniform_token_count(
+-    num_reqs: int,
+-    num_tokens: int,
+-    max_query_len: int,
++    num_reqs: int, num_tokens: int, max_query_len: int
+ ) -> int | None:
++    """Return the common query length for a shape-uniform batch.
++
++    Shape test only, valid for batches known to be decoding by construction
++    (e.g. dummy runs). Scheduled batches must use
++    `get_uniform_decode_token_count`.
++
++    Args:
++        num_reqs: Number of requests in the constructed batch.
++        num_tokens: Total number of query tokens in the batch.
++        max_query_len: Largest query length in the batch.
++
++    Returns:
++        The common query length when all requests have that length, otherwise
++        None.
+     """
+-    Return the uniform token count if batch is uniform, else None.
+-    A batch is uniform if all requests have the same number of tokens.
+-    """
+-    if (max_query_len == num_tokens // num_reqs) and (
+-        num_tokens == max_query_len * num_reqs
+-    ):
++    if is_uniform_query_len(num_reqs, num_tokens, max_query_len):
+         return max_query_len
+     return None
+ 
+@@ -535,6 +544,83 @@ class CudaGraphManager:
+                         compilation_counter.num_cudagraph_captured += 1
+         self._graphs_captured = True
+ 
++    @torch.inference_mode()
++    def profile_memory(
++        self,
++        create_forward_fn: CreateForwardFn,
++        *,
++        channel_id: str = "vllm:target:profile",
++    ) -> dict[CUDAGraphMode, tuple[int, int]]:
++        """Estimate total capture memory by capturing all graphs once and
++        measuring the net device-memory delta (the same method ``capture_model``
++        uses at runtime), then clearing them so the real capture starts clean.
++
++        An earlier version dry-captured only the 2 largest graphs per mode and
++        extrapolated ``per_graph * (n - 1)``; that over-reserved badly (~13x) for
++        models with many widely-spaced capture sizes (e.g. ``max_num_seqs=256``
++        -> sizes 1..512), because the large-graph cost was charged to the many
++        tiny graphs. Capturing the full set once is exact, at the cost of one
++        extra full capture during startup (~2x capture time).
++
++        Returns ``{FULL: (total_bytes, 0)}`` shaped for the runner's
++        ``max(shared) + sum(per_graph)`` combination (per_graph=0 because the
++        single capture already counted every graph).
++        """
++        if not self._capture_descs:
++            return {}
++
++        saved_graphs_captured = self._graphs_captured
++        # Dry-capture into a throwaway mempool, mirroring the MRv1 runner. Both
++        # wrapper classes keep their own instance registry, so each needs
++        # redirecting: torch.compile piecewise graphs live in CUDAGraphWrapper,
++        # breakable ones in BreakableCUDAGraphWrapper. Sharing the real pool
++        # here is not safe -- discarding the profiling graphs afterwards drops
++        # that pool's use_count to zero and the real capture's capture_begin
++        # then trips an allocator assert, while *not* discarding them leaves the
++        # real capture pass replaying graphs recorded against the throwaway
++        # profiling KV cache.
++        profiling_pool = current_platform.graph_pool_handle()
++        wrappers = list(CUDAGraphWrapper._all_instances) + list(
++            BreakableCUDAGraphWrapper._all_instances
++        )
++        original_pool = self.pool
++        original_wrapper_pools = {id(w): w.graph_pool for w in wrappers}
++        self.pool = profiling_pool
++        for wrapper in wrappers:
++            wrapper.graph_pool = profiling_pool
++        try:
++            gc.collect()
++            torch.accelerator.synchronize()
++            torch.accelerator.empty_cache()
++            start_free = torch.accelerator.get_memory_info()[0]
++            # Call CudaGraphManager.capture directly (not self.capture):
++            # subclasses override capture() with a different signature
++            # (model, model_state, ...) that builds create_forward_fn, but here
++            # the factory is already built.
++            CudaGraphManager.capture(
++                self,
++                create_forward_fn,
++                channel_id=channel_id,
++                progress_bar_desc="Profiling CUDA graph memory",
++            )
++            torch.accelerator.synchronize()
++            end_free = torch.accelerator.get_memory_info()[0]
++            total = max(start_free - end_free, 0)
++        finally:
++            # Discard profiling-only graphs so the real capture re-allocates.
++            self.graphs.clear()
++            self._graphs_captured = saved_graphs_captured
++            CUDAGraphWrapper.clear_all_graphs()
++            BreakableCUDAGraphWrapper.clear_all_graphs()
++            self.pool = original_pool
++            for wrapper in wrappers:
++                wrapper.graph_pool = original_wrapper_pools[id(wrapper)]
++        logger.debug(
++            "Estimated CUDA graph memory (full dry-capture): %.2f MiB",
++            total / (1 << 20),
++        )
++        return {CUDAGraphMode.FULL: (total, 0)}
++
+     def dispatch(
+         self,
+         num_reqs: int,
+@@ -657,7 +743,75 @@ class ModelCudaGraphManager(CudaGraphManager):
+         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+         if self.use_breakable_cg:
+             self.init_breakable_cg_runner(model)
++        create_forward_fn = self._build_forward_fn_factory(
++            model,
++            model_state,
++            input_buffers,
++            intermediate_tensors,
++            block_tables,
++            attn_groups,
++            kv_cache_config,
++            has_lora=has_lora,
++            use_aux_hidden_state_outputs=use_aux_hidden_state_outputs,
++            lora_capture_hook=lora_capture_hook,
++        )
++        return super().capture(
++            create_forward_fn,
++            channel_id=channel_id,
++            progress_bar_desc=progress_bar_desc,
++        )
++
++    def profile_memory(
++        self,
++        model: nn.Module,
++        model_state: ModelState,
++        input_buffers: InputBuffers,
++        intermediate_tensors: IntermediateTensors | None,
++        block_tables: BlockTables,
++        attn_groups: list[list[AttentionGroup]],
++        kv_cache_config: KVCacheConfig,
++        has_lora: bool = False,
++        use_aux_hidden_state_outputs: bool = False,
++        lora_capture_hook: Callable[[int, int, int], None] | None = None,
++        *,
++        channel_id: str = "vllm:target:profile",
++    ) -> dict[CUDAGraphMode, tuple[int, int]]:
++        """Dry-capture-based capture-memory estimate.
++
++        See :meth:`CudaGraphManager.profile_memory`. The runner calls this
++        during memory profiling so the KV-cache budget reserves room for
++        cudagraph capture (avoids OOM at high ``gpu_memory_utilization``).
++        """
++        self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
++        if self.use_breakable_cg:
++            self.init_breakable_cg_runner(model)
++        create_forward_fn = self._build_forward_fn_factory(
++            model,
++            model_state,
++            input_buffers,
++            intermediate_tensors,
++            block_tables,
++            attn_groups,
++            kv_cache_config,
++            has_lora=has_lora,
++            use_aux_hidden_state_outputs=use_aux_hidden_state_outputs,
++            lora_capture_hook=lora_capture_hook,
++        )
++        return super().profile_memory(create_forward_fn, channel_id=channel_id)
+ 
++    def _build_forward_fn_factory(
++        self,
++        model: nn.Module,
++        model_state: ModelState,
++        input_buffers: InputBuffers,
++        intermediate_tensors: IntermediateTensors | None,
++        block_tables: BlockTables,
++        attn_groups: list[list[AttentionGroup]],
++        kv_cache_config: KVCacheConfig,
++        has_lora: bool,
++        use_aux_hidden_state_outputs: bool,
++        lora_capture_hook: Callable[[int, int, int], None] | None,
++    ) -> CreateForwardFn:
+         def create_forward_fn(
+             desc: BatchExecutionDescriptor,
+             warmup: bool,
+@@ -761,11 +915,7 @@ class ModelCudaGraphManager(CudaGraphManager):
+ 
+             return forward_fn
+ 
+-        super().capture(
+-            create_forward_fn,
+-            channel_id=channel_id,
+-            progress_bar_desc=progress_bar_desc,
+-        )
++        return create_forward_fn
+ 
+     def clear(self) -> None:
+         super().clear()

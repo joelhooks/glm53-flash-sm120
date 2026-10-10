@@ -1,0 +1,146 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index ea1f5a7b6..9b24c8c61 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -243,6 +243,7 @@ from .utils import (
+     KVBlockZeroer,
+     add_kv_sharing_layers_to_kv_cache_groups,
+     bind_kv_cache,
++    compressed_kernel_block_size,
+     copy_kv_cache_blocks_inplace,
+     prepare_kernel_block_sizes,
+     sanity_check_mm_encoder_outputs,
+@@ -1204,6 +1205,7 @@ class GPUModelRunner(
+             cache_dtype=self.cache_config.cache_dtype,
+             runner_only_attn_layers=self.runner_only_attn_layers,
+             static_forward_context=self.compilation_config.static_forward_context,
++            num_blocks=self.kv_cache_config.num_blocks,
+         )
+ 
+     def _zero_block_ids(self, block_ids: list[int]) -> None:
+@@ -4015,6 +4017,25 @@ class GPUModelRunner(
+             **model_kwargs,
+         )
+ 
++    def _all_reqs_past_prompt(self, num_reqs: int) -> bool:
++        """True when every scheduled request has finished its prompt.
++
++        ``num_computed_tokens_cpu`` holds the count from *before* this step, so
++        a request still inside a chunked prefill compares strictly less than its
++        prompt length. Cheap numpy compare over ``num_reqs`` entries; safe for
++        ``num_reqs == 0`` (vacuously true) and on the dummy-run path, where the
++        result is discarded in favour of ``force_uniform_decode``.
++        """
++        if num_reqs <= 0:
++            return True
++        batch = self.input_batch
++        return bool(
++            np.all(
++                batch.num_computed_tokens_cpu[:num_reqs]
++                >= batch.num_prompt_tokens[:num_reqs]
++            )
++        )
++
+     @staticmethod
+     def _is_uniform_decode(
+         max_num_scheduled_tokens: int,
+@@ -6492,7 +6513,7 @@ class GPUModelRunner(
+             else:
+                 raise e
+         if self.speculative_config:
+-            draft_token_ids = [[0] for _ in range(num_reqs)]
++            draft_token_ids = [[0] * self.num_spec_tokens for _ in range(num_reqs)]
+             dummy_spec_decode_metadata = SpecDecodeMetadata.make_dummy(
+                 draft_token_ids, self.device
+             )
+@@ -6696,6 +6717,42 @@ class GPUModelRunner(
+         self.encoder_cache.clear()
+         gc.collect()
+ 
++    @torch.inference_mode()
++    def profile_single_request_prefill(self) -> None:
++        """Profile the maximum text-prefill shape before sizing the KV cache.
++
++        The ordinary profile distributes ``max_num_batched_tokens`` across
++        ``max_num_seqs`` requests. Sparse-attention metadata and communication
++        workspaces can have a larger peak for one request containing the entire
++        token budget. A temporary KV cache makes that attention path available;
++        dummy slot mappings suppress cache writes, so minimal storage is enough.
++        """
++        with set_current_vllm_config(self.vllm_config):
++            self._init_minimal_kv_cache_for_profiling()
++
++        model_output: tuple[torch.Tensor, torch.Tensor] | None = None
++        sampler_output: Any = None
++        try:
++            model_output = self._dummy_run(
++                self.max_num_tokens,
++                force_attention=True,
++                skip_eplb=True,
++                is_profile=True,
++                include_mm_inputs=False,
++                single_request_prefill=True,
++            )
++            hidden_states, last_hidden_states = model_output
++            if get_pp_group().is_last_rank:
++                if self.is_pooling_model:
++                    sampler_output = self._dummy_pooler_run(hidden_states)
++                else:
++                    sampler_output = self._dummy_sampler_run(last_hidden_states)
++            self._sync_device()
++        finally:
++            del model_output, sampler_output
++            self.encoder_cache.clear()
++            self._cleanup_profiling_kv_cache()
++
+     def _init_minimal_kv_cache_for_profiling(self) -> None:
+         from vllm.v1.core.kv_cache_utils import (
+             get_kv_cache_config_from_groups,
+@@ -7720,9 +7777,11 @@ class GPUModelRunner(
+         kernel_block_size: int,
+         cache_dtype_str: str,
+     ) -> tuple[int, ...]:
+-        # For MLA with compression, storage_block_size != block_size.
++        # For MLA with compression, storage_block_size != block_size. Use the
++        # virtually-split kernel page (compressed_kernel_block_size), matching
++        # the kernel_num_blocks computed in _reshape_kv_cache_tensors.
+         if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
+-            shape_block_size = kv_cache_spec.storage_block_size
++            shape_block_size = compressed_kernel_block_size(kv_cache_spec)
+         else:
+             shape_block_size = kernel_block_size
+         return attn_backend.get_kv_cache_shape(
+@@ -7837,10 +7896,22 @@ class GPUModelRunner(
+                     num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                 if isinstance(kv_cache_spec, AttentionSpec):
+                     has_attn = True
+-                    num_blocks_per_kv_block = (
+-                        kv_cache_spec.block_size // kernel_block_size
+-                    )
+-                    kernel_num_blocks = num_blocks * num_blocks_per_kv_block
++                    # Compressed MLA (storage_block_size != block_size, e.g. the
++                    # glm5_next indexer kpool) is never split into attention
++                    # kernel blocks; it is split into its own pool pages when
++                    # the storage block exceeds one supported paged-MQA page.
++                    # Must mirror _get_attention_kv_cache_shape exactly, or the
++                    # reshape and the block count disagree.
++                    if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
++                        _shape_block = compressed_kernel_block_size(kv_cache_spec)
++                        kernel_num_blocks = num_blocks * (
++                            kv_cache_spec.storage_block_size // _shape_block
++                        )
++                    else:
++                        num_blocks_per_kv_block = (
++                            kv_cache_spec.block_size // kernel_block_size
++                        )
++                        kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+ 
+                     # Skipped layers (--kv-cache-dtype-skip-layers) need
+                     # the unquantized shape.

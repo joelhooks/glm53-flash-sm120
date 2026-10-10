@@ -1,0 +1,19 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/config/compilation.py b/vllm/config/compilation.py
+index 2dc814a25..cdbb91212 100644
+--- a/vllm/config/compilation.py
++++ b/vllm/config/compilation.py
+@@ -772,6 +772,7 @@ class CompilationConfig:
+         "vllm::gdn_attention_core_xpu",
+         "vllm::olmo_hybrid_gdn_full_forward",
+         "vllm::sparse_attn_indexer",
++        "vllm::sparse_attn_indexer_kpool",
+         "vllm::rocm_aiter_sparse_attn_indexer",
+         "vllm::minimax_m3_sparse_attention_with_output",
+         "vllm::deepseek_v4_attention",

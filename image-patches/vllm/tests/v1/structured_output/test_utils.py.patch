@@ -1,0 +1,80 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/v1/structured_output/test_utils.py b/tests/v1/structured_output/test_utils.py
+index c026ab0e4..42e97e48f 100644
+--- a/tests/v1/structured_output/test_utils.py
++++ b/tests/v1/structured_output/test_utils.py
+@@ -1,8 +1,14 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from types import SimpleNamespace
++
++import numpy as np
+ import pytest
++import torch
+ 
++from vllm.v1.core.sched.output import GrammarOutput
++from vllm.v1.structured_output import utils
+ from vllm.v1.structured_output.backend_xgrammar import (
+     has_xgrammar_unsupported_json_features,
+ )
+@@ -104,3 +110,53 @@ def test_supported_json_features(supported_schema):
+     assert not has_xgrammar_unsupported_json_features(supported_schema), (
+         "Schema should be supported"
+     )
++
++
++def test_apply_grammar_bitmask_preserves_source_offsets_after_draft_trimming(
++    monkeypatch,
++):
++    """A trimmed request must not shift another request's grammar rows.
++
++    The scheduler serializes masks at its scheduled speculative width. A worker
++    may trim grammar-invalid drafts before applying those masks, so source and
++    destination offsets must be advanced with their respective widths.
++    """
++    scheduler_output = SimpleNamespace(
++        scheduled_spec_decode_tokens={
++            "trimmed-request": [1],
++            "full-request": [2, 3, 4],
++        }
++    )
++    grammar_output = GrammarOutput(
++        structured_output_request_ids=["trimmed-request", "full-request"],
++        grammar_bitmask=np.array(
++            [[10], [11], [12], [13], [20], [21], [22], [23]],
++            dtype=np.int32,
++        ),
++        num_spec_tokens=[3, 3],
++    )
++    input_batch = SimpleNamespace(req_ids=["trimmed-request", "full-request"])
++    logits = torch.zeros((6, 32))
++    applied_bitmask = None
++
++    def capture_bitmask(logits, bitmask, indices):
++        nonlocal applied_bitmask
++        applied_bitmask = bitmask.clone()
++        assert indices is None
++
++    monkeypatch.setattr(
++        utils,
++        "xgr",
++        SimpleNamespace(apply_token_bitmask_inplace=capture_bitmask),
++    )
++    monkeypatch.setattr(utils, "PIN_MEMORY", False)
++
++    utils.apply_grammar_bitmask(
++        scheduler_output,
++        grammar_output,
++        input_batch,
++        logits,
++    )
++
++    assert applied_bitmask is not None
++    assert applied_bitmask[:, 0].tolist() == [10, 13, 20, 21, 22, 23]

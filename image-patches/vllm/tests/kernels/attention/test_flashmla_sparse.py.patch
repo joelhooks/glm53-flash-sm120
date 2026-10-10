@@ -1,0 +1,60 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/kernels/attention/test_flashmla_sparse.py b/tests/kernels/attention/test_flashmla_sparse.py
+index aceffbece..ccc8cd1b4 100644
+--- a/tests/kernels/attention/test_flashmla_sparse.py
++++ b/tests/kernels/attention/test_flashmla_sparse.py
+@@ -4,17 +4,20 @@ import pytest
+ import torch
+ 
+ 
+-def test_deepseek_v4_c128a_dynamic_topk_packed_buffers():
++def test_deepseek_v4_c128a_metadata_preserves_capacity_stride():
+     from vllm.models.deepseek_v4.sparse_mla import build_c128a_topk_metadata
+ 
+     device = torch.device("cuda")
+     capacity_width = 256
+     active_width = 128
+-    global_decode_buffer = torch.empty(
+-        (2, capacity_width), dtype=torch.int32, device=device
++    untouched = -77
++    global_decode_buffer = torch.full(
++        (2, capacity_width), untouched, dtype=torch.int32, device=device
+     )
+     decode_lens_buffer = torch.empty(2, dtype=torch.int32, device=device)
+-    prefill_buffer = torch.empty((2, capacity_width), dtype=torch.int32, device=device)
++    prefill_buffer = torch.full(
++        (2, capacity_width), untouched, dtype=torch.int32, device=device
++    )
+ 
+     global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
+         positions=torch.tensor([255, 511], dtype=torch.int64, device=device),
+@@ -31,15 +34,17 @@ def test_deepseek_v4_c128a_dynamic_topk_packed_buffers():
+         max_compressed_tokens=active_width,
+     )
+ 
+-    assert global_decode.shape == (1, active_width)
+-    assert prefill_local.shape == (1, active_width)
+-    assert global_decode.stride() == (active_width, 1)
+-    assert prefill_local.stride() == (active_width, 1)
++    assert global_decode.shape == (1, capacity_width)
++    assert prefill_local.shape == (1, capacity_width)
++    assert global_decode.stride() == (capacity_width, 1)
++    assert prefill_local.stride() == (capacity_width, 1)
+     assert global_decode[0, :2].cpu().tolist() == [768, 769]
+     assert decode_lens.cpu().tolist() == [2]
+     assert prefill_local[0, :4].cpu().tolist() == list(range(4))
+-    assert torch.all(global_decode[0, 2:] == -1)
+-    assert torch.all(prefill_local[0, 4:] == -1)
++    assert torch.all(global_decode[0, 2:active_width] == -1)
++    assert torch.all(prefill_local[0, 4:active_width] == -1)
++    assert torch.all(global_decode[0, active_width:] == untouched)
++    assert torch.all(prefill_local[0, active_width:] == untouched)
+ 
+ 
+ def test_sparse_flashmla_metadata_smoke():

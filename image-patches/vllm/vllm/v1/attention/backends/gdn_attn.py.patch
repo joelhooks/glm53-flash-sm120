@@ -1,0 +1,116 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index 5d583b3ab..7cf2ed208 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -196,6 +196,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+         )
+ 
+         spec_sequence_masks_cpu: torch.Tensor | None = None
++        non_spec_active_mask_cpu: torch.Tensor | None = None
+         if (
+             not self.use_spec_decode
+             or num_decode_draft_tokens_cpu is None
+@@ -218,17 +219,57 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                 )
+ 
+         if spec_sequence_masks is None:
+-            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+-                split_decodes_and_prefills(m, decode_threshold=1)
+-            )
++            query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
++            non_spec_active_mask_cpu = query_lens_cpu > 0
++            if torch.all(non_spec_active_mask_cpu).item():
++                num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
++                    split_decodes_and_prefills(m, decode_threshold=1)
++                )
++            else:
++                # FULL graphs and DCP can leave zero-token request rows in the
++                # local metadata.  They are graph padding/no-ops, not recurrent
++                # decodes: passing their NULL block IDs to causal_conv1d_update
++                # triggers a device-side bounds assertion.
++                active_query_lens_cpu = query_lens_cpu[non_spec_active_mask_cpu]
++                num_decodes = (active_query_lens_cpu == 1).sum().item()
++                num_prefills = (active_query_lens_cpu > 1).sum().item()
++                num_decode_tokens = num_decodes
++                num_prefill_tokens = (
++                    active_query_lens_cpu.sum().item() - num_decode_tokens
++                )
+             num_spec_decode_tokens = 0
+             spec_token_indx = None
+             non_spec_token_indx = None
+             spec_state_indices_tensor = None
+-            non_spec_state_indices_tensor = block_table_tensor[:, 0]
++            non_spec_state_indices_tensor = block_table_tensor[
++                non_spec_active_mask_cpu, 0
++            ]
+             spec_query_start_loc = None
+-            non_spec_query_start_loc = query_start_loc
+-            non_spec_query_start_loc_cpu = query_start_loc_cpu
++            if torch.all(non_spec_active_mask_cpu).item():
++                non_spec_query_start_loc = query_start_loc
++                non_spec_query_start_loc_cpu = query_start_loc_cpu
++            else:
++                active_query_lens = query_start_loc[1:] - query_start_loc[:-1]
++                active_query_lens = active_query_lens[non_spec_active_mask_cpu]
++                non_spec_query_start_loc = torch.zeros(
++                    active_query_lens.size(0) + 1,
++                    dtype=torch.int32,
++                    device=query_start_loc.device,
++                )
++                torch.cumsum(
++                    active_query_lens,
++                    dim=0,
++                    out=non_spec_query_start_loc[1:],
++                )
++                non_spec_query_start_loc_cpu = torch.zeros(
++                    active_query_lens_cpu.size(0) + 1,
++                    dtype=torch.int32,
++                )
++                torch.cumsum(
++                    active_query_lens_cpu,
++                    dim=0,
++                    out=non_spec_query_start_loc_cpu[1:],
++                )
+             num_accepted_tokens = None
+         else:
+             query_lens = query_start_loc[1:] - query_start_loc[:-1]
+@@ -284,10 +325,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                 non_spec_query_start_loc = None
+                 non_spec_query_start_loc_cpu = None
+             else:
++                # Do not pass output_size here. FULL-graph token padding is a
++                # global dispatch size, while DCP query_lens is rank-local; a
++                # static padded output size can therefore exceed sum(query_lens)
++                # and assert inside CUDA repeat_interleave on mixed MTP steps.
+                 spec_token_masks = torch.repeat_interleave(
+                     spec_sequence_masks,
+                     query_lens,
+-                    output_size=query_start_loc_cpu[-1].item(),
+                 )
+                 index = torch.argsort(spec_token_masks, stable=True)
+                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
+@@ -402,6 +446,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             if spec_sequence_masks_cpu is not None:
+                 has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
+                 assert non_spec_query_start_loc_cpu is not None
++            elif non_spec_active_mask_cpu is not None:
++                has_initial_state = has_initial_state[non_spec_active_mask_cpu]
+             nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                 compute_causal_conv1d_metadata(
+                     non_spec_query_start_loc_cpu,
+@@ -479,7 +525,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             and num_decodes <= self.decode_cudagraph_max_bs
+         ):
+             self.non_spec_state_indices_tensor[:num_decodes].copy_(
+-                non_spec_state_indices_tensor, non_blocking=True
++                non_spec_state_indices_tensor[:num_decodes], non_blocking=True
+             )
+             non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
+                 :batch_size

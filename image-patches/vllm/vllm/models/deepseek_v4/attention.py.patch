@@ -1,0 +1,23 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
+index 376100fac..4501caf89 100644
+--- a/vllm/models/deepseek_v4/attention.py
++++ b/vllm/models/deepseek_v4/attention.py
+@@ -1276,7 +1276,10 @@ class DeepseekV4Indexer(nn.Module):
+         attn_metadata = get_forward_context().attn_metadata
+         if isinstance(attn_metadata, dict):
+             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
+-            if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:
++            if (
++                indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens
++                and not torch.cuda.is_current_stream_capturing()
++            ):
+                 # candidates num smaller than topk, every candidate is selected
+                 # but we still need to build k cache
+                 compressor(compressed_kv_score, positions, rotary_emb)

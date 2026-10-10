@@ -1,0 +1,65 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index f0b93da29..a0c5eeeab 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -761,6 +761,17 @@ class Platform:
+         if cache_config.mamba_page_size_padded is not None:
+             cache_config.mamba_page_size_padded = shared_page
+ 
++    @classmethod
++    def _get_indexer_block_alignment(cls, vllm_config: "VllmConfig") -> int | None:
++        """Extra ``block_size`` multiple a sparse indexer needs, else ``None``.
++
++        The CUDA kpool paged-MQA indexer virtually splits each storage block
++        into pool pages, so ``block_size`` must be a multiple of
++        ``index_kpool * min(PAGED_MQA_PAGE_SIZES)`` — implemented in the CUDA
++        platform override. Other platforms impose no extra constraint.
++        """
++        return None
++
+     @classmethod
+     def _align_hybrid_block_size(
+         cls,
+@@ -783,6 +794,7 @@ class Platform:
+             MambaSpec,
+             MLAAttentionSpec,
+             get_kv_quant_mode,
++            get_mla_kv_model_version,
+         )
+ 
+         cache_config = vllm_config.cache_config
+@@ -798,12 +810,17 @@ class Platform:
+ 
+         # Compute attention page size for 1 token
+         if model_config.use_mla:
++            model_version = get_mla_kv_model_version(
++                cache_config.cache_dtype, model_config.hf_text_config
++            )
+             attn_page_size_1_token = MLAAttentionSpec(
+                 block_size=1,
+                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                 head_size=model_config.get_head_size(),
+                 dtype=kv_cache_dtype,
++                cache_dtype_str=cache_config.cache_dtype,
+                 kv_quant_mode=kv_quant_mode,
++                model_version=model_version,
+             ).page_size_bytes
+         elif cache_config.cache_dtype.startswith("turboquant_"):
+             # TQ has a packed K|V layout; the standard FullAttentionSpec
+@@ -905,6 +922,9 @@ class Platform:
+                 mamba_page_size,
+                 kernel_block_alignment_size * attn_page_size_1_token,
+             )
++            indexer_align = cls._get_indexer_block_alignment(vllm_config)
++            if indexer_align:
++                attn_block_size = indexer_align * cdiv(attn_block_size, indexer_align)
+ 
+         if cache_config.block_size < attn_block_size:
+             cache_config.block_size = attn_block_size

@@ -1,0 +1,15 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (files untracked in the image)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash2/__init__.py b/vllm/v1/worker/gpu/spec_decode/dflash2/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..208f01a7cb5ee04c88d276fec2082cd4e830884b
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/dflash2/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project

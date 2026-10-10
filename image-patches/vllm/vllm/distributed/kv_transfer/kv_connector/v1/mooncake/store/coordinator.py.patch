@@ -1,0 +1,24 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index de5c84635..2deb702f1 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -104,6 +104,12 @@ class MooncakeStoreCoordinator:
+         """
+         attention_groups: list[SpecGroup] = []
+         for i, g in enumerate(self.kv_cache_groups):
++            # Skip groups that opt out of prefix caching (e.g. GLM-5.3-Flash
++            # kpool tail): per-request scratch, never shareable, so they must
++            # not participate in hit lookup. Mirrors core's
++            # KVCacheCoordinator.verify_and_split_kv_cache_groups.
++            if not g.kv_cache_spec.participates_in_prefix_caching:
++                continue
+             spec = _unwrap_spec(g.kv_cache_spec)
+             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+             assert manager_cls is not None, (

@@ -1,0 +1,46 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index 87545b092..cadd3e1fc 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -116,6 +116,7 @@ _TEXT_GENERATION_MODELS = {
+     "Glm4MoeForCausalLM": ("glm4_moe", "Glm4MoeForCausalLM"),
+     "Glm4MoeLiteForCausalLM": ("glm4_moe_lite", "Glm4MoeLiteForCausalLM"),
+     "GlmMoeDsaForCausalLM": ("deepseek_v2", "GlmMoeDsaForCausalLM"),
++    "Glm5NextForCausalLM": ("vllm.models.glm5next", "Glm5NextForCausalLM"),
+     "GptOssForCausalLM": ("gpt_oss", "GptOssForCausalLM"),
+     "GPT2LMHeadModel": ("gpt2", "GPT2LMHeadModel"),
+     "GPTJForCausalLM": ("gpt_j", "GPTJForCausalLM"),
+@@ -421,6 +422,10 @@ _MULTIMODAL_MODELS = {
+     "Glm4vForConditionalGeneration": ("glm4_1v", "Glm4vForConditionalGeneration"),
+     "Glm4vMoeForConditionalGeneration": ("glm4_1v", "Glm4vMoeForConditionalGeneration"),
+     "GlmOcrForConditionalGeneration": ("glm_ocr", "GlmOcrForConditionalGeneration"),
++    "Glm5NextForConditionalGeneration": (
++        "vllm.models.glm5next",
++        "Glm5NextForConditionalGeneration",
++    ),
+     "GraniteSpeechForConditionalGeneration": (
+         "granite_speech",
+         "GraniteSpeechForConditionalGeneration",
+@@ -623,6 +628,7 @@ _SPECULATIVE_DECODING_MODELS = {
+     "EagleLlama4ForCausalLM": ("llama4_eagle", "EagleLlama4ForCausalLM"),
+     "EagleMiniCPMForCausalLM": ("minicpm_eagle", "EagleMiniCPMForCausalLM"),
+     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
++    "DFlash2DraftModel": ("qwen3_dflash2", "DFlash2Qwen3ForCausalLM"),
+     "DSparkDraftModel": ("vllm.models.deepseek_v4", "DSparkDeepseekV4ForCausalLM"),
+     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
+     "K3DSparkModel": (
+@@ -664,6 +670,7 @@ _SPECULATIVE_DECODING_MODELS = {
+     "Glm4MoeMTPModel": ("glm4_moe_mtp", "Glm4MoeMTP"),
+     "Glm4MoeLiteMTPModel": ("glm4_moe_lite_mtp", "Glm4MoeLiteMTP"),
+     "GlmOcrMTPModel": ("glm_ocr_mtp", "GlmOcrMTP"),
++    "Glm5NextMTPModel": ("vllm.models.glm5next", "Glm5NextMTP"),
+     "MedusaModel": ("medusa", "Medusa"),
+     "OpenPanguMTPModel": ("openpangu_mtp", "OpenPanguMTP"),
+     "Qwen3NextMTP": ("qwen3_next_mtp", "Qwen3NextMTP"),

@@ -1,0 +1,46 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/b12x/comm/pcie/pcie_allreduce.py b/b12x/comm/pcie/pcie_allreduce.py
+index 973d470..ac6d14c 100644
+--- a/b12x/comm/pcie/pcie_allreduce.py
++++ b/b12x/comm/pcie/pcie_allreduce.py
+@@ -34,7 +34,10 @@ from .pcie_oneshot import (
+     DEFAULT_MAX_SIZE,
+     DEFAULT_RANK_DATA_BYTES,
+     SUPPORTED_WORLD_SIZES as ONESHOT_WORLD_SIZES,
++    TP2_PLAIN_REMOTE_PUSH_MAX_BYTES,
++    TP4_PLAIN_ONESHOT_MAX_BYTES,
+     PCIeOneshotAllReducePool,
++    _tp2_plain_remote_push_enabled,
+ )
+ 
+ 
+@@ -61,13 +64,18 @@ def _algorithm_override() -> str:
+ def recommended_max_bytes(world_size: int, *, default: int = DEFAULT_MAX_SIZE) -> int:
+     """Largest all-reduce this runtime expects to win at, for this world size.
+ 
+-    Callers that force the equal-quarter implementation advertise its complete
+-    qualified capacity. Automatic consumers retain their existing limit
+-    because a CUDA-graph caller without explicit output storage cannot use the
+-    equal-quarter implementation for large messages and may otherwise replace
+-    a faster fallback collective with hierarchical all-reduce.
++    TP2 advertises the complete 4096-wide peer-push row envelope when that
++    transport is enabled. TP4 advertises the one-shot byte range measured
++    below its NCCL crossover. The runtime's ``should_route_plain_allreduce``
++    method selects only qualified tensors inside these allocation capacities.
++    TP12/TP16 advertise the equal-quarter capacity only when explicitly
++    selected because its CUDA-graph output contract is more restrictive.
+     """
+ 
++    if world_size == 2 and _tp2_plain_remote_push_enabled():
++        return max(default, TP2_PLAIN_REMOTE_PUSH_MAX_BYTES)
++    if world_size == 4:
++        return max(default, TP4_PLAIN_ONESHOT_MAX_BYTES)
+     if world_size in ISLAND_RS_WORLD_SIZES and _algorithm_override() == "island_rs":
+         return max(default, ISLAND_RS_MAX_BYTES)
+     return default

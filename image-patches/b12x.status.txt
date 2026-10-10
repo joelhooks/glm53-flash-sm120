@@ -1,0 +1,30 @@
+ M b12x/_lib/intrinsics.py
+ M b12x/attention/_shared/mla/api.py
+ M b12x/attention/_shared/mla/io.py
+ M b12x/attention/_shared/mla/io_mg.py
+ M b12x/attention/_shared/mla/kernel.py
+ M b12x/attention/_shared/mla/kv_cache.py
+ M b12x/attention/_shared/mla/prefill.py
+ M b12x/attention/_shared/mla/prefill_mg.py
+ M b12x/attention/_shared/mla/smem.py
+ M b12x/attention/_shared/mla/smem_mg.py
+ M b12x/attention/_shared/mla/traits.py
+M  b12x/comm/pcie/_cute_intrinsics.py
+M  b12x/comm/pcie/_oneshot_cute.py
+M  b12x/comm/pcie/pcie_allreduce.py
+M  b12x/comm/pcie/pcie_oneshot.py
+A  b12x/comm/pcie/plain_allreduce_calibration.py
+A  b12x/comm/pcie/plain_allreduce_probe.py
+A  b12x/moe/_shared/dynamic_launch_tuning.py
+ M b12x/moe/_shared/kernels/w4a16/host.py
+ M b12x/moe/_shared/kernels/w4a16/kernel.py
+ M b12x/moe/fused_moe/__init__.py
+MM b12x/moe/fused_moe/_impl.py
+ M b12x/moe/fused_moe/api.py
+M  tests/comm/test_pcie_hierarchical.py
+M  tests/comm/test_pcie_oneshot.py
+M  tests/comm/test_pcie_oneshot_torture.py
+A  tests/comm/test_plain_allreduce_calibration.py
+A  tests/comm/test_plain_allreduce_probe.py
+A  tests/moe/test_dynamic_launch_tuning.py
+?? b12x/moe/fused_moe/_btx_adoption.py

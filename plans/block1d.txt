@@ -1,0 +1,6 @@
+# Block 1d: KDA prefill metadata probe, then control and rate.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+probe probe 2 1 8
+probe probe 2 2 8
+source baseline 1 1 4
+source baseline 2 2 8

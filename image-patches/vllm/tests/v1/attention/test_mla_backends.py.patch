@@ -1,0 +1,28 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/v1/attention/test_mla_backends.py b/tests/v1/attention/test_mla_backends.py
+index b27d9b707..9c9443970 100644
+--- a/tests/v1/attention/test_mla_backends.py
++++ b/tests/v1/attention/test_mla_backends.py
+@@ -89,6 +89,8 @@ def test_mla_post_load_preallocates_quantized_absorbed_weights(monkeypatch):
+     layer.kv_cache_dtype = "auto"
+     layer.quant_config = None
+     layer.layer_name = "test"
++    materialized_devices = []
++    layer.dcp_manager = SimpleNamespace(materialize=materialized_devices.append)
+     dequantized = torch.arange(28.0, dtype=torch.float32).reshape(14, 2)
+     events = []
+     preallocated = []
+@@ -124,6 +126,7 @@ def test_mla_post_load_preallocates_quantized_absorbed_weights(monkeypatch):
+     assert layer.W_UK_T.data_ptr() == preallocated[1].data_ptr()
+     assert layer.W_UV.device == layer.kv_b_proj.qweight.device
+     assert layer.W_UK_T.device == layer.kv_b_proj.qweight.device
++    assert materialized_devices == [layer.kv_b_proj.qweight.device]
+ 
+ 
+ @pytest.mark.cpu_test

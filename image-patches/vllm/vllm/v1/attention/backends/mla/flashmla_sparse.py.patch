@@ -1,0 +1,37 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse.py b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+index e8be7ad5b..8e65d6597 100644
+--- a/vllm/v1/attention/backends/mla/flashmla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+@@ -112,8 +112,9 @@ class FlashMLASparseBackend(AttentionBackend):
+ 
+     @classmethod
+     def get_supported_head_sizes(cls) -> list[int]:
+-        # DeepSeek V3.2 layout: 512 NoPE + 64 RoPE = 576.
+-        return [576]
++        # 576 = 512 NoPE + 64 RoPE (with-rope layout); 512 = 512 NoPE only
++        # (no-rope layout, qk_rope_head_dim == 0). Both share D_V = 512.
++        return [512, 576]
+ 
+     @classmethod
+     def is_mla(cls) -> bool:
+@@ -849,7 +850,12 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
+         if isinstance(q, tuple):
+             ql_nope, q_pe = q
+             q = self.q_concat_buffer[: ql_nope.shape[0]]
+-            ops.concat_mla_q(ql_nope, q_pe, q)
++            if self.qk_rope_head_dim == 0:
++                # No RoPE component (d_qk == kv_lora_rank): q is the NoPE part
++                # alone. concat_mla_q requires rope_dim == 64, so copy directly.
++                q.copy_(ql_nope)
++            else:
++                ops.concat_mla_q(ql_nope, q_pe, q)
+ 
+         num_actual_toks = q.shape[0]
+ 

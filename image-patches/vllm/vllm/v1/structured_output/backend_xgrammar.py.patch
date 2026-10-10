@@ -1,0 +1,65 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/structured_output/backend_xgrammar.py b/vllm/v1/structured_output/backend_xgrammar.py
+index 58b726bf7..29659c4e3 100644
+--- a/vllm/v1/structured_output/backend_xgrammar.py
++++ b/vllm/v1/structured_output/backend_xgrammar.py
+@@ -156,11 +156,12 @@ class XgrammarGrammar(StructuredOutputGrammar):
+     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
+         """Accepts a list of tokens and advances the FSM.
+ 
+-        Returns True if the FSM was advanced successfully.
+-        Returns False if the FSM failed to advance.
++        Returns True if all grammar-constrained tokens were accepted.
++        Tokens after termination are ignored. Returns False if the FSM
++        failed to advance.
+         """
+         if self._is_terminated:
+-            return False
++            return True
+         for token in tokens:
+             if not self.matcher.accept_token(token):
+                 logger.error(
+@@ -171,7 +172,9 @@ class XgrammarGrammar(StructuredOutputGrammar):
+                 )
+                 return False
+             self.num_processed_tokens += 1
+-        self._is_terminated = self.matcher.is_terminated()
++            self._is_terminated = self.matcher.is_terminated()
++            if self._is_terminated:
++                break
+         return True
+ 
+     def validate_tokens(self, tokens: list[int]) -> list[int]:
+@@ -180,10 +183,15 @@ class XgrammarGrammar(StructuredOutputGrammar):
+ 
+         Returns the prefix list of tokens that are accepted by the FSM.
+         """
++        if self._is_terminated:
++            return []
++
+         accepted_tokens = []
+         for token in tokens:
+             if self.matcher.accept_token(token):
+                 accepted_tokens.append(token)
++                if self.matcher.is_terminated():
++                    break
+             else:
+                 break
+         if len(accepted_tokens) > 0:
+@@ -203,8 +211,9 @@ class XgrammarGrammar(StructuredOutputGrammar):
+         return self._is_terminated
+ 
+     def reset(self):
+-        self.num_processed_tokens = 0
+         self.matcher.reset()
++        self.num_processed_tokens = 0
++        self._is_terminated = False
+ 
+ 
+ # cf https://github.com/mlc-ai/xgrammar/blob/a32ac892676d2eedc0327416105b9b06edfb94b2/cpp/json_schema_converter.cc

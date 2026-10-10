@@ -1,0 +1,27 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 9bd837815..136e6c6d1 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -112,6 +112,15 @@ class InputBatch:
+     # Seeded per num_tokens so all TP ranks generate identical ids.
+     dummy_input_ids_random_high: ClassVar[int] = 0
+ 
++    @property
++    def has_prefill(self) -> bool:
++        """Whether any scheduled request is still consuming prompt tokens.
++
++        Returns:
++            True when at least one request is prefilling.
++        """
++        return bool(self.is_prefilling_np.any())
++
+     @classmethod
+     def make_dummy(
+         cls,

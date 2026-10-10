@@ -1,0 +1,25 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py b/tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py
+index ff77c96e6..e6ff19358 100644
+--- a/tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py
++++ b/tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py
+@@ -32,6 +32,13 @@ def test_sm120_backend_uses_dedicated_backend_name() -> None:
+     )
+ 
+ 
++def test_sm120_backend_uses_sparse_mqa_for_prefill() -> None:
++    impl_cls = FlashInferMLASparseSM120Backend.get_impl_cls()
++
++    assert impl_cls.is_sparse
++    assert not impl_cls.supports_dense_mha_prefill
++
++
+ def test_v32_glm_sm120_backend_accepts_glm_block_size(
+     monkeypatch,
+ ) -> None:

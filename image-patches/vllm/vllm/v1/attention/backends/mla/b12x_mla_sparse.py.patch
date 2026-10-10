@@ -1,0 +1,536 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/attention/backends/mla/b12x_mla_sparse.py b/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+index 41ee607df..e090b507f 100644
+--- a/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+@@ -57,6 +57,7 @@ from vllm.v1.attention.backend import (
+     MultipleOf,
+ )
+ from vllm.v1.attention.backends.mla.sparse_utils import (
++    triton_convert_req_index_to_global_index,
+     triton_filter_and_convert_dcp_index,
+ )
+ from vllm.v1.attention.backends.utils import (
+@@ -133,10 +134,48 @@ def _kv_fp8_rope_enabled() -> bool:
+ # Inline-scale two-level NVFP4 records: the writer derives a per-token
+ # second-level scale (fp32 at record bytes [292, 296)) and the readers consume
+ # it from the record instead of a per-layer launch scalar.  Requires the
+-# 368-byte KV_FP8_ROPE=1 record and a B12X build with the matching
+-# writer/reader mode.  Mutually exclusive with VLLM_NVFP4_MLA_SCALES_FILE.
++# 368-byte KV_FP8_ROPE=1 record, or the GLM-5.3 NoPE 304-byte record, and a
++# B12X build with the matching writer/reader mode. Mutually exclusive with
++# VLLM_NVFP4_MLA_SCALES_FILE.
+ _NVFP4_DYNAMIC_SCALE_REQUESTED = NVFP4_MLA_CACHE_FORMAT.dynamic_scale
+ 
++# Absorbed MLA query width, q_head_dim = kv_lora_rank + qk_rope_head_dim:
++#   GLM_NSA  (GLM-5.2)        512 + 64 = 576
++#   GLM_NOPE (GLM-5.3-Flash)  512 +  0 = 512   (mla_use_nope)
++_NSA_Q_HEAD_DIM = 576
++_NOPE_Q_HEAD_DIM = 512
++
++
++def _current_model_uses_nope_mla() -> bool | None:
++    """Resolve semantic NoPE from model config when a config context exists.
++
++    Cache-shape resolution can receive an adapter-facing physical head width,
++    so that width is not authoritative for GLM-5.3. Return None only when the
++    config context is genuinely unavailable, allowing legacy callers/tests to
++    fall back to the supplied head size.
++    """
++    from vllm.config import get_current_vllm_config
++
++    try:
++        vllm_config = get_current_vllm_config()
++    except Exception:
++        return None
++    model_config = getattr(vllm_config, "model_config", None)
++    if model_config is None:
++        return None
++    text_config = getattr(model_config, "hf_text_config", None)
++    if text_config is None:
++        text_config = getattr(model_config, "hf_config", None)
++    if text_config is None or not hasattr(text_config, "qk_rope_head_dim"):
++        return None
++    return int(text_config.qk_rope_head_dim) == 0
++
++# Keep the dedicated GLM_NOPE NVFP4 path behind an explicit image-level gate.
++# The local b12x build carries the rope-less gather, shared-memory, prefill, and
++# decode specializations; upstream/default images must continue to fail closed.
++_GLM_NOPE_NVFP4_OPT_IN_ENV = "VLLM_B12X_GLM_NOPE_NVFP4"
++_GLM_NOPE_NVFP4_OPT_IN = os.environ.get(_GLM_NOPE_NVFP4_OPT_IN_ENV, "0") == "1"
++
+ 
+ def _require_callable_parameters(
+     feature: str,
+@@ -224,6 +263,11 @@ class _CKVPrefetchWorkspacePool:
+         )
+         self._free_slots = list(reversed(range(self.max_slots)))
+         self._leased_slots: set[int] = set()
++        # Metadata builders used for graph capture and ordinary execution can
++        # differ while borrowing the same physical WorkspaceManager lane. The
++        # pool owns the state map so those builders share one ring and one
++        # pending-work lifecycle for each backing workspace.
++        self._state_map: dict[_CKVWorkspaceIdentity, _CKVPrefetchState] = {}
+ 
+     def acquire(self) -> tuple[int, torch.Tensor]:
+         if not self._free_slots:
+@@ -414,16 +458,23 @@ _CKV_PREFETCH_STATE_REGISTRIES: weakref.WeakSet = weakref.WeakSet()
+ 
+ 
+ class _CKVPrefetchStateRegistry:
+-    """Builder-owned states partitioned by lane-scoped CKV workspace."""
++    """Access pool-owned states partitioned by lane-scoped CKV workspace."""
+ 
+     def __init__(self, workspace_pool: _CKVPrefetchWorkspacePool | None = None) -> None:
+         self.states: dict[_CKVWorkspaceIdentity, _CKVPrefetchState] = {}
+-        self.workspace_pool = workspace_pool
++        self.workspace_pool: _CKVPrefetchWorkspacePool | None = None
++        if workspace_pool is not None:
++            self._bind_workspace_pool(workspace_pool)
+         _CKV_PREFETCH_STATE_REGISTRIES.add(self)
+ 
+     def _bind_workspace_pool(self, pool: _CKVPrefetchWorkspacePool) -> None:
+         if self.workspace_pool is None:
++            if self.states:
++                raise RuntimeError(
++                    "CKV prefetch registry cannot bind a pool after creating states"
++                )
+             self.workspace_pool = pool
++            self.states = pool._state_map
+         elif self.workspace_pool is not pool:
+             raise RuntimeError("CKV prefetch registry cannot switch workspace pools")
+ 
+@@ -746,9 +797,13 @@ class B12xMLASparseBackend(AttentionBackend):
+ 
+     @classmethod
+     def get_supported_head_sizes(cls) -> list[int]:
+-        # GLM_NSA contract: q_head_dim = kv_lora_rank (512) + qk_rope_head_dim
+-        # (64) = 576. The unified decode raises on any other q_head_dim.
+-        return [576]
++        # q_head_dim = kv_lora_rank + qk_rope_head_dim, so GLM_NSA is 576 and
++        # NoPE (GLM-5.3-Flash, qk_rope_head_dim=0) is 512. 512 is admitted here
++        # only so the NVFP4 NoPE record can be selected: supports_combination
++        # rejects every other cache dtype at that width, because b12x has no
++        # 512-wide fp8/bf16 MLA record and DSV4 also lands on q_head_dim 512,
++        # so an unguarded 512 would read DSV4 geometry off a NoPE cache.
++        return [_NOPE_Q_HEAD_DIM, _NSA_Q_HEAD_DIM]
+ 
+     @classmethod
+     def is_mla(cls) -> bool:
+@@ -785,6 +840,25 @@ class B12xMLASparseBackend(AttentionBackend):
+             hf_text_config = vllm_config.model_config.hf_text_config
+             if not hasattr(hf_text_config, "index_topk"):
+                 return "B12X_MLA_SPARSE requires a model with index_topk config"
++        # FAIL-CLOSED: q_head_dim 512 is ambiguous in b12x -- it is both the
++        # NoPE contract (kv_lora_rank 512 + rope 0) and DSV4's (448 + 64). Only
++        # the NVFP4 record width tells them apart, so refuse 512 for any other
++        # cache dtype rather than let a NoPE model silently take DSV4 geometry.
++        if head_size == _NOPE_Q_HEAD_DIM:
++            if kv_cache_dtype != "nvfp4_ds_mla":
++                return (
++                    "B12X_MLA_SPARSE supports head_size=512 "
++                    "(qk_rope_head_dim=0) only with "
++                    f"kv_cache_dtype='nvfp4_ds_mla'; got {kv_cache_dtype!r}"
++                )
++            if not _GLM_NOPE_NVFP4_OPT_IN:
++                # Do not let an ordinary image select a locally patched device
++                # contract merely because the host-side width is compatible.
++                return (
++                    "B12X_MLA_SPARSE NoPE (head_size=512) NVFP4 requires the "
++                    "dedicated rope-less b12x device build. Set "
++                    f"{_GLM_NOPE_NVFP4_OPT_IN_ENV}=1 only in that image."
++                )
+         return None
+ 
+     @staticmethod
+@@ -801,6 +875,23 @@ class B12xMLASparseBackend(AttentionBackend):
+             # layout; b12x's GLM_NSA decode reads the same record.
+             return (num_blocks, block_size, 656)
+         if cache_dtype_str == "nvfp4_ds_mla":
++            configured_nope = _current_model_uses_nope_mla()
++            is_nope = (
++                head_size == _NOPE_Q_HEAD_DIM
++                if configured_nope is None
++                else configured_nope
++            )
++            if is_nope:
++                # GLM_NOPE: 256 B E2M1 latent + 32 B E4M3 group-16 scales and
++                # no RoPE tail at all -- a strict 288 B prefix of the GLM_NSA
++                # record. The dynamic per-token FP32 latent scale widens it to
++                # 304 B; there is no fp8-rope variant because there is no RoPE
++                # sub-record to quantize.
++                return (
++                    num_blocks,
++                    block_size,
++                    304 if _NVFP4_DYNAMIC_SCALE_REQUESTED else 288,
++                )
+             # NVFP4 MLA latent: 256 B E2M1 NoPE data + 32 B E4M3 group-16
+             # scales. The stock record has 16 B pad + 128 B BF16 RoPE (432 B).
+             # KV_FP8_ROPE=1 reuses the pad for one FP32 amax scale and stores
+@@ -899,6 +990,16 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
+         self.num_speculative_tokens = int(
+             getattr(spec_config, "num_speculative_tokens", 0) or 0
+         )
++        # IndexPool models score compressed K rows, then expand the winners
++        # back to request-relative token ids. Their index-cache page ids cannot
++        # be reused as MLA-cache page ids, so DCP1 must remap those logical ids
++        # through the MLA block table just like the DCP path does.
++        self.indexer_outputs_logical = (
++            int(getattr(self.model_config.hf_config, "index_kpool", 1) or 1) > 1
++        )
++        self.needs_index_mapping = (
++            self.dcp_world_size > 1 or self.indexer_outputs_logical
++        )
+ 
+         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+         max_seqs = vllm_config.scheduler_config.max_num_seqs
+@@ -916,7 +1017,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
+         self.cache_seq_lens_per_req_buffer = torch.empty(
+             (max_seqs,), dtype=torch.int32, device=device
+         )
+-        if self.dcp_world_size > 1:
++        if self.needs_index_mapping:
+             self.req_id_per_token_buffer = torch.empty(
+                 (max_tokens,), dtype=torch.int32, device=device
+             )
+@@ -929,7 +1030,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
+             self.req_ids_arange = torch.arange(
+                 max_tokens, dtype=torch.int32, device=device
+             )
+-            if ckv_gather_requested:
++            if self.dcp_world_size > 1 and ckv_gather_requested:
+                 self.ckv_page_table_1_buffer = torch.empty(
+                     (max_tokens, self.topk_tokens), dtype=torch.int32, device=device
+                 )
+@@ -1074,9 +1175,10 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
+         # has exactly the graph-stable tensor both b12x consumers need, so bind it
+         # directly instead of staging two identical D2D copies.
+         if cm.max_query_len <= 1 and num_tokens == cm.num_reqs:
+-            if use_dcp:
++            if self.needs_index_mapping:
+                 assert self.req_ids_arange is not None
+                 req_id_per_token_tensor = self.req_ids_arange[:num_tokens]
++            if use_dcp:
+                 self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
+                     seq_lens_for_req[:num_tokens], non_blocking=True
+                 )
+@@ -1112,7 +1214,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
+                 )
+ 
+             req_ids = None
+-            if use_dcp:
++            if self.needs_index_mapping:
+                 req_ids = np.zeros((num_tokens,), dtype=np.int32)
+                 if num_query_tokens:
+                     req_ids[:num_query_tokens] = req_id_per_token_np
+@@ -1288,6 +1390,10 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+         self._kv_fp8_rope = bool(
+             self.kv_cache_dtype == "nvfp4_ds_mla" and _kv_fp8_rope_enabled()
+         )
++        self._kv_nope_nvfp4 = bool(
++            self.kv_cache_dtype == "nvfp4_ds_mla"
++            and int(mla_args["qk_rope_head_dim"]) == 0
++        )
+         if _KV_FP8_ROPE_REQUESTED and not _is_glm_moe_dsa_model():
+             logger.warning(
+                 "KV_FP8_ROPE=1 ignored: compact MLA records are restricted to "
+@@ -1299,7 +1405,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+                 "record is GLM nvfp4_ds_mla-only",
+                 self.kv_cache_dtype,
+             )
+-        if self._kv_fp8_rope:
++        if self._kv_fp8_rope or self._kv_nope_nvfp4:
+             try:
+                 from b12x.attention._shared.mla.kv_cache import (
+                     concat_and_cache_nvfp4_mla_fp8_rope,
+@@ -1313,12 +1419,15 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+                 concat_and_cache_nvfp4_mla_fp8_rope
+             )
+         self._nvfp4_dynamic_scale = bool(
+-            self._kv_fp8_rope and _NVFP4_DYNAMIC_SCALE_REQUESTED
++            (self._kv_fp8_rope or self._kv_nope_nvfp4)
++            and _NVFP4_DYNAMIC_SCALE_REQUESTED
+         )
+-        if _NVFP4_DYNAMIC_SCALE_REQUESTED and not self._kv_fp8_rope:
++        if _NVFP4_DYNAMIC_SCALE_REQUESTED and not (
++            self._kv_fp8_rope or self._kv_nope_nvfp4
++        ):
+             raise RuntimeError(
+-                "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 requires the 368-byte "
+-                "KV_FP8_ROPE=1 nvfp4_ds_mla record (got kv_cache_dtype="
++                "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 requires a compact GLM "
++                "nvfp4_ds_mla record (got kv_cache_dtype="
+                 f"{self.kv_cache_dtype!r}, KV_FP8_ROPE="
+                 f"{'1' if _kv_fp8_rope_enabled() else '0'})"
+             )
+@@ -1339,7 +1448,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+         self.qk_nope_head_dim: int = mla_args["qk_nope_head_dim"]
+         self.qk_rope_head_dim: int = mla_args["qk_rope_head_dim"]
+         self.v_head_dim: int = mla_args.get("v_head_dim", 512)
+-        # GLM_NSA contract: q_head_dim = kv_lora_rank (512) + qk_rope (64) = 576.
++        # GLM_NSA is 512 + 64 = 576; NoPE (GLM-5.3-Flash) is 512 + 0 = 512.
+         self.q_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+         # Query absorption sees a head-major, non-contiguous Q view. Some
+         # cuBLAS BF16 BMM kernels read past tight custom allocations, so route
+@@ -1355,11 +1464,22 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+             "B12X_MLA_SPARSE requires sparse-MLA top-k indices "
+             "(model with index_topk in its config)."
+         )
+-        self.topk_tokens = int(self.topk_indices_buffer.shape[-1])
+-
+         from vllm.config import get_current_vllm_config
+ 
+         vllm_config = get_current_vllm_config()
++        hf_config = getattr(
++            getattr(vllm_config, "model_config", None), "hf_config", None
++        )
++        physical_topk_capacity = int(self.topk_indices_buffer.shape[-1])
++        self.topk_tokens = int(
++            getattr(indexer, "topk_tokens", None)
++            or getattr(hf_config, "index_topk", physical_topk_capacity)
++        )
++        if not 0 < self.topk_tokens <= physical_topk_capacity:
++            raise RuntimeError(
++                "B12X_MLA_SPARSE semantic top-k must fit the indexer buffer: "
++                f"logical={self.topk_tokens}, capacity={physical_topk_capacity}"
++            )
+         parallel_config = vllm_config.parallel_config
+         self.dcp_workspace_non_dbo = not bool(parallel_config.enable_dbo)
+         self.dcp_world_size = parallel_config.decode_context_parallel_size
+@@ -1375,11 +1495,25 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+         self.total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+         self.need_to_return_lse_for_decode = self.dcp_world_size > 1
+ 
+-        expects_physical_slots = self.dcp_world_size == 1
+-        if (
+-            indexer is not None
+-            and bool(indexer.output_physical_slots) != expects_physical_slots
+-        ):
++        configured_index_kpool = int(
++            getattr(indexer, "index_kpool", None)
++            or getattr(hf_config, "index_kpool", 1)
++            or 1
++        )
++        self.indexer_outputs_logical = configured_index_kpool > 1
++        if indexer is not None:
++            indexer_outputs_physical = bool(indexer.output_physical_slots)
++            if self.indexer_outputs_logical and indexer_outputs_physical:
++                raise RuntimeError(
++                    "B12X_MLA_SPARSE IndexPool requires logical sparse-indexer "
++                    "output so MLA-cache slots can be remapped independently"
++                )
++        else:
++            indexer_outputs_physical = not self.indexer_outputs_logical
++        expects_physical_slots = self.dcp_world_size == 1 and not (
++            self.indexer_outputs_logical
++        )
++        if indexer_outputs_physical != expects_physical_slots:
+             expected = "physical" if expects_physical_slots else "logical"
+             raise RuntimeError(
+                 f"B12X_MLA_SPARSE requires {expected} sparse-indexer output "
+@@ -1397,11 +1531,18 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+         # only changes its RoPE tail; the latent format and outer-scale
+         # correction are deliberately untouched.
+         self._b12x_scale_format = 2 if self.kv_cache_dtype == "nvfp4_ds_mla" else None
+-        self._kv_record_bytes = (
+-            (368 if self._kv_fp8_rope else 432)
+-            if self.kv_cache_dtype == "nvfp4_ds_mla"
+-            else 656
+-        )
++        if self.kv_cache_dtype == "nvfp4_ds_mla":
++            if self.q_head_dim == _NOPE_Q_HEAD_DIM:
++                # GLM-5.3 NoPE has no RoPE sub-record: its packed E2M1 latent
++                # and E4M3 scales occupy 288 bytes (304 with the optional
++                # per-token scale), matching get_kv_cache_shape above.
++                self._kv_record_bytes = (
++                    304 if _NVFP4_DYNAMIC_SCALE_REQUESTED else 288
++                )
++            else:
++                self._kv_record_bytes = 368 if self._kv_fp8_rope else 432
++        else:
++            self._kv_record_bytes = 656
+         logger.info(
+             "B12X GLM MLA KV format: KV_FP8_ROPE=%d kv_gmem_stride=%d "
+             "kv_cache_dtype=%s",
+@@ -1497,7 +1638,12 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+         # scalar initialization is needed. final_lse is pre-materialized as a view
+         # so the legacy lazy torch.empty(final_lse) never fires during capture.
+         def _make_plan(
+-            mode: str, max_q_rows: int, num_q_heads: int, max_batch: int
++            mode: str,
++            max_q_rows: int,
++            num_q_heads: int,
++            max_batch: int,
++            *,
++            head_major_output: bool,
+         ) -> Any:
+             return plan_sparse_mla_scratch(
+                 B12XSparseMLAScratchCaps(
+@@ -1513,7 +1659,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+                     max_batch=int(max_batch),
+                     max_chunks_per_row=self._num_splits_cap,
+                     page_size=self.block_size,
+-                    head_major_output=self._head_major_mla_output,
++                    head_major_output=head_major_output,
+                 )
+             )
+ 
+@@ -1522,9 +1668,17 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+             self._decode_max_rows,
+             self._kernel_num_heads,
+             self._decode_max_rows,
++            # Direct DCP A2A consumes token-major packed heads. Preserve the
++            # established head-major layout for DCP1, where the outer MLA
++            # projection can consume it without a distributed combine.
++            head_major_output=self.dcp_world_size == 1,
+         )
+         self._extend_plan = _make_plan(
+-            "extend", max_batched, self._kernel_num_heads, max_num_seqs
++            "extend",
++            max_batched,
++            self._kernel_num_heads,
++            max_num_seqs,
++            head_major_output=self._head_major_mla_output,
+         )
+         # One caller-owned uint8 scratch tensor covers either path (the larger
+         # layout); the per-mode materializer carves its views from the prefix.
+@@ -1638,7 +1792,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+         # (no head all-gather), global seq lens.
+         if self._ckv_gather_enabled:
+             self._ckv_extend_plan = _make_plan(
+-                "extend", max_batched, self._ckv_kernel_num_heads, max_num_seqs
++                "extend",
++                max_batched,
++                self._ckv_kernel_num_heads,
++                max_num_seqs,
++                head_major_output=self._head_major_mla_output,
+             )
+             self._scratch_nbytes = max(
+                 self._scratch_nbytes,
+@@ -1733,7 +1891,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+         b12x package writer API, which does not replace or perturb the stock
+         writer used by KV_FP8_ROPE=0.
+         """
+-        if not self._kv_fp8_rope:
++        if not (self._kv_fp8_rope or self._kv_nope_nvfp4):
+             return super().do_kv_cache_update(
+                 kv_c_normed,
+                 k_pe,
+@@ -1782,6 +1940,28 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+             ).transpose(0, 1)
+         return workspaces
+ 
++    def _materialize_mla_query(
++        self,
++        ql_nope: torch.Tensor,
++        q_pe: torch.Tensor,
++        output: torch.Tensor,
++    ) -> None:
++        """Join absorbed MLA query parts, specializing the rope-less ABI."""
++        if self.qk_rope_head_dim == 0:
++            if q_pe.shape[-1] != 0:
++                raise ValueError(
++                    "GLM NoPE query must carry a zero-width RoPE tensor; "
++                    f"got shape {tuple(q_pe.shape)}"
++                )
++            if ql_nope.shape != output.shape:
++                raise ValueError(
++                    "GLM NoPE absorbed query must exactly match the B12X "
++                    f"workspace: {tuple(ql_nope.shape)} != {tuple(output.shape)}"
++                )
++            output.copy_(ql_nope)
++            return
++        ops.concat_mla_q(ql_nope, q_pe, output)
++
+     def _borrow_workspace_parts(
+         self,
+     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+@@ -1967,7 +2147,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+                 local_chunk = q_workspace_flat.narrow(
+                     0, local_offset, local_numel
+                 ).view(chunk_rows, local_heads, head_dim)
+-                ops.concat_mla_q(
++                self._materialize_mla_query(
+                     ql_nope.narrow(0, chunk_start, chunk_rows),
+                     q_pe.narrow(0, chunk_start, chunk_rows),
+                     local_chunk,
+@@ -2544,7 +2724,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+                 )
+             q_buffer = q_buffer[:num_actual_toks]
+             q_all = q_buffer[:, :num_input_heads]
+-            ops.concat_mla_q(ql_nope, q_pe, q_all)
++            self._materialize_mla_query(ql_nope, q_pe, q_all)
+         else:
+             num_actual_toks = q.shape[0]
+             num_input_heads = q.shape[1]
+@@ -2567,7 +2747,9 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+                 q_all.copy_(q.contiguous())
+ 
+         assert self.topk_indices_buffer is not None
+-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
++        topk_indices = self.topk_indices_buffer[
++            :num_actual_toks, : self.topk_tokens
++        ]
+         per_token_cache = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
+         if use_ckv_gather:
+             assert attn_metadata.req_id_per_token is not None
+@@ -2642,11 +2824,29 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+                 out=nsa_cache_seqlens,
+             )
+             _mask_page_table_after_nsa_len(selected_indices, nsa_cache_seqlens)
+-        else:
++        elif not self.indexer_outputs_logical:
+             # Without DCP, the b12x indexer writes flat physical cache slots
+             # directly into the shared top-k buffer.
+             selected_indices = topk_indices
+             nsa_cache_seqlens = per_token_cache
++        else:
++            # IndexPool returns request-relative token ids even without DCP.
++            # Its compressed index-cache block table is not the MLA block
++            # table, so remap through the latter into graph-stable scratch.
++            assert attn_metadata.req_id_per_token is not None
++            assert attn_metadata.page_table_1 is not None
++            selected_indices = attn_metadata.page_table_1[
++                :num_actual_toks, : topk_indices.shape[1]
++            ]
++            triton_convert_req_index_to_global_index(
++                attn_metadata.req_id_per_token[:num_actual_toks],
++                attn_metadata.block_table,
++                topk_indices,
++                BLOCK_SIZE=attn_metadata.block_size,
++                NUM_TOPK_TOKENS=topk_indices.shape[1],
++                out=selected_indices,
++            )
++            nsa_cache_seqlens = per_token_cache
+ 
+         # KV cache -> paged rank-3 uint8. B12X unified SM120 kernels consume
+         # flat slot ids in selected_indices, but compute raw byte offsets as:
+@@ -2812,10 +3012,18 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
+                     ),
+                 )
+                 if self._pad_heads:
+-                    assert dense_out_workspace is not None
+-                    dense_out = dense_out_workspace[:num_actual_toks]
+-                    dense_out.copy_(out[:, : self._input_num_heads, :])
+-                    out = dense_out
++                    if self.dcp_world_size > 1:
++                        # The token-major decode plan may retain an aligned
++                        # head-capacity pitch. Slicing the padded tail keeps
++                        # heads packed (stride(1) == head_dim), which is the
++                        # direct DCP reducer's explicit ABI; a head-major copy
++                        # would violate it during engine warmup.
++                        out = out[:, : self._input_num_heads, :]
++                    else:
++                        assert dense_out_workspace is not None
++                        dense_out = dense_out_workspace[:num_actual_toks]
++                        dense_out.copy_(out[:, : self._input_num_heads, :])
++                        out = dense_out
+                     lse = lse[:, : self._input_num_heads]
+                 return out, lse
+             out = cast(

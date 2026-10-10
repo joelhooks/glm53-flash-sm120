@@ -1,0 +1,40 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/structured_output/utils.py b/vllm/v1/structured_output/utils.py
+index 0629a6d2e..c2b445a52 100644
+--- a/vllm/v1/structured_output/utils.py
++++ b/vllm/v1/structured_output/utils.py
+@@ -131,14 +131,24 @@ def apply_grammar_bitmask(
+     )
+     sorted_bitmask = sorted_bitmask_tensor.numpy()
+     cumulative_index = 0
+-    for req_id in grammar_output.structured_output_request_ids:
+-        num_spec_tokens = len(spec_tokens.get(req_id, ()))
++    for req_id, num_grammar_spec_tokens in zip(
++        grammar_output.structured_output_request_ids,
++        grammar_output.num_spec_tokens,
++        strict=True,
++    ):
++        num_worker_spec_tokens = len(spec_tokens.get(req_id, ()))
++        assert num_worker_spec_tokens <= num_grammar_spec_tokens
+         if (logit_idx := struct_out_req_batch_indices.get(req_id)) is not None:
+-            for i in range(1 + num_spec_tokens):
++            for i in range(num_worker_spec_tokens):
+                 bitmask_index = logit_idx + i
+                 sorted_bitmask[bitmask_index] = grammar_bitmask[cumulative_index + i]
+                 out_indices.append(bitmask_index)
+-        cumulative_index += 1 + num_spec_tokens
++            bonus_index = logit_idx + num_worker_spec_tokens
++            sorted_bitmask[bonus_index] = grammar_bitmask[
++                cumulative_index + num_grammar_spec_tokens
++            ]
++            out_indices.append(bonus_index)
++        cumulative_index += 1 + num_grammar_spec_tokens
+ 
+     # Copy async to device.
+     grammar_bitmask = sorted_bitmask_tensor.to(logits.device, non_blocking=True)

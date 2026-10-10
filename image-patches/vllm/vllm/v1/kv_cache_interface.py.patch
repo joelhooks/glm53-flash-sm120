@@ -1,0 +1,178 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 14f238b4c..34293b92c 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -8,12 +8,13 @@ from collections import Counter
+ from dataclasses import dataclass, fields, replace
+ from enum import Enum, IntEnum
+ from math import prod
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Any
+ 
+ import torch
+ from typing_extensions import Self
+ 
+ from vllm.logger import init_logger
++from vllm.model_executor.layers.mla_cache_format import NVFP4_MLA_CACHE_FORMAT
+ from vllm.utils.math_utils import cdiv, round_up
+ from vllm.utils.torch_utils import get_dtype_size, nvfp4_kv_cache_full_dim
+ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+@@ -82,6 +83,19 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
+     return KVQuantMode.NONE
+ 
+ 
++def get_mla_kv_model_version(
++    kv_cache_dtype: str, hf_text_config: Any
++) -> str | None:
++    """Return the cache-record ABI selected by semantic MLA dimensions."""
++    if (
++        kv_cache_dtype == "nvfp4_ds_mla"
++        and getattr(hf_text_config, "qk_rope_head_dim", None) == 0
++        and getattr(hf_text_config, "kv_lora_rank", None) == 512
++    ):
++        return "glm_nope"
++    return None
++
++
+ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
+     return get_kv_quant_mode(kv_cache_dtype) != KVQuantMode.NONE
+ 
+@@ -113,6 +127,21 @@ class KVCacheSpec:
+     # number of tokens in a block
+     block_size: int
+ 
++    @property
++    def participates_in_prefix_caching(self) -> bool:
++        """Whether this spec's group participates in prefix caching.
++
++        Co-owned / transient groups that are not real block allocators (e.g.
++        GLM-5.3-Flash kpool tail, a 1-block/req circular scratch buffer whose
++        content is per-request and overwritten in place) opt out by returning
++        ``False``. The structural prefix-caching machinery (the global
++        ``cache_config.block_size`` min, the hybrid divisibility assert, and the
++        ``attention_groups`` hit-lookup) then ignores them, so a non-shareable
++        group can neither drag the block size down nor cap the hybrid hit at 0.
++        Their manager still allocates/frees blocks normally.
++        """
++        return True
++
+     @property
+     def page_size_bytes(self) -> int:
+         """
+@@ -492,6 +521,12 @@ class MLAAttentionSpec(FullAttentionSpec):
+             # DeepseekV4 (448-NoPE q_head_dim=512) and GLM/V3.2 (512-NoPE
+             # q_head_dim=576) family specs; the writer asserts kv_lora_rank
+             # so a mismatched geometry fails loudly at store time.
++            if self.model_version == "glm_nope":
++                # GLM-5.3 NoPE: 256 B packed E2M1 latent plus 32 B E4M3
++                # group-16 scales. Dynamic mode appends a 16-byte inline-scale
++                # trailer; there is no RoPE sub-record.
++                record_bytes = 304 if NVFP4_MLA_CACHE_FORMAT.dynamic_scale else 288
++                return self.storage_block_size * record_bytes
+             if self.model_version == "deepseek_v4":
+                 return self.storage_block_size * 432
+             if self.model_version == "glm_fp8_rope":
+@@ -863,6 +898,57 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
+         )
+ 
+ 
++@dataclass(frozen=True, kw_only=True)
++class KpoolTailSpec(SlidingWindowSpec):
++    """GLM-5.3-Flash kpool indexer tail cache: a paged circular buffer holding the
++    in-progress (incomplete) kpool's raw K + gate score.
++
++    One block of ``block_size`` (== ``index_kpool``) slots per request,
++    overwritten circularly by ``pos % kpool`` as decode/spec-decode advances.
++    Prefill writes the trailing incomplete pool's raw K+gate here (instead of
++    discarding it) so the boundary pool can be compressed correctly on the
++    decode side, including across PD disaggregation. Raw K is packed as the "K"
++    half of each block and the gate score as the "V" half
++    (``head_size_v == head_size``).
++
++    The SW base is reused only for its ``real_page_size_bytes`` formula and the
++    admission-cap wiring; the manager is swapped to ``KpoolTailManager`` via the
++    registry, because ``SlidingWindowManager``'s mid-pool eviction would destroy
++    the in-progress pool. Admission is fixed at 1 block/req regardless of
++    ``sliding_window``/``max_in_flight_tokens``: the in-progress pool is always
++    <= kpool tokens (completed pools are flushed), so MTP > kpool still fits in
++    one circularly-reused block.
++    """
++
++    def max_admission_blocks_per_request(
++        self, max_in_flight_tokens: int, max_model_len: int
++    ) -> int:
++        # The in-progress pool is <= kpool tokens == 1 block, circularly reused.
++        # No growth, no window sliding -> exactly one block per request, even
++        # under spec-decode (MTP > kpool): completed pools flush mid-step.
++        return 1
++
++    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
++        # One block per request for the request's whole lifetime; caps the
++        # per-request block_table buffer the runner sizes via this method.
++        return 1
++
++    def is_uniform_with_collection(
++        self, kv_cache_specs: dict[str, KVCacheSpec]
++    ) -> bool:
++        return all(isinstance(spec, KpoolTailSpec) for spec in kv_cache_specs.values())
++
++    @property
++    def participates_in_prefix_caching(self) -> bool:
++        # The tail is a per-request circular scratch buffer (1 block/req,
++        # overwritten by ``pos % kpool``), not a real block allocator: its
++        # contents are transient and never shareable across requests. Exclude
++        # it from the structural prefix-caching machinery so it neither drags
++        # the global block size down to ``kpool`` nor caps the hybrid hit at 0.
++        # ``KpoolTailManager`` already no-ops the manager-level cache hooks.
++        return False
++
++
+ @dataclass(frozen=True)
+ class MambaSpec(KVCacheSpec):
+     shapes: tuple[tuple[int, ...], ...]
+@@ -873,15 +959,18 @@ class MambaSpec(KVCacheSpec):
+     num_speculative_blocks: int = 0
+ 
+     @property
+-    def page_size_bytes(self) -> int:
+-        page_size = sum(
++    def real_page_size_bytes(self) -> int:
++        return sum(
+             prod(shape) * get_dtype_size(dtype)
+             for (shape, dtype) in zip(self.shapes, self.dtypes)
+         )
++
++    @property
++    def page_size_bytes(self) -> int:
+         if self.page_size_padded is not None:
+-            assert self.page_size_padded >= page_size
++            assert self.page_size_padded >= self.real_page_size_bytes
+             return self.page_size_padded
+-        return page_size
++        return self.real_page_size_bytes
+ 
+     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+         if vllm_config.cache_config.mamba_cache_mode == "all":
+@@ -1002,6 +1091,15 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
+ 
+     kv_cache_specs: dict[str, KVCacheSpec]
+ 
++    @property
++    def participates_in_prefix_caching(self) -> bool:
++        # A uniform group shares one block allocator; if any member is a
++        # non-shareable scratch spec (e.g. KpoolTailSpec), the group's blocks
++        # can't be reused across requests, so the whole group opts out.
++        return all(
++            s.participates_in_prefix_caching for s in self.kv_cache_specs.values()
++        )
++
+     @property
+     def page_size_bytes(self) -> int:
+         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())

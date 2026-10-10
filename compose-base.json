@@ -1,0 +1,97 @@
+{
+  "name": "glm53-repro",
+  "services": {
+    "server": {
+      "image": "verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692",
+      "container_name": "glm53-repro-server",
+      "labels": {},
+      "init": true,
+      "ipc": "host",
+      "shm_size": "32g",
+      "ports": ["127.0.0.1:8000:8000"],
+      "environment": {
+        "B12X_GL53_ROUTE128_HYBRID_TAIL": "1",
+        "B12X_GL53_ROUTE128_WIDE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "KV_FP8_ROPE": "0",
+        "NCCL_IB_DISABLE": "1",
+        "NCCL_P2P_LEVEL": "4",
+        "OMP_NUM_THREADS": "2",
+        "VLLM_B12X_GLM_NOPE_NVFP4": "1",
+        "VLLM_ENABLE_PCIE_ALLREDUCE": "1",
+        "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
+        "VLLM_EXL3_PREFILL_BLOCK_M": "128",
+        "VLLM_EXL3_PREFILL_TRELLIS": "1",
+        "VLLM_NVFP4_MLA_DYNAMIC_SCALE": "0",
+        "VLLM_NVFP4_MLA_SCALES_FILE": "/opt/glm53/calibration/glm53_nvfp4_mla_outer_scales_mtp_power2_v2.json",
+        "VLLM_PCIE_ALLREDUCE_BACKEND": "cpp",
+        "VLLM_USE_B12X_DCP_A2A": "1",
+        "HF_HOME": "/models/hf",
+        "TMPDIR": "/cache/tmp"
+      },
+      "volumes": ["${HF_CACHE}:/models/hf:ro", "${RUN_CACHE}:/cache"],
+      "command": [
+        "serve",
+        "${MODEL_PATH}",
+        "--language-model-only",
+        "--tensor-parallel-size",
+        "2",
+        "--enable-expert-parallel",
+        "--decode-context-parallel-size",
+        "2",
+        "--dcp-comm-backend",
+        "a2a",
+        "--dtype",
+        "bfloat16",
+        "--load-format",
+        "safetensors",
+        "--moe-backend",
+        "b12x",
+        "--attention-backend",
+        "B12X_MLA_SPARSE",
+        "--kv-cache-dtype",
+        "nvfp4_ds_mla",
+        "--max-num-batched-tokens",
+        "2048",
+        "--max-num-seqs",
+        "4",
+        "--gpu-memory-utilization",
+        "0.986",
+        "--enable-chunked-prefill",
+        "--enable-prefix-caching",
+        "--generation-config",
+        "${MODEL_PATH}",
+        "--reasoning-parser",
+        "glm45",
+        "--tool-call-parser",
+        "glm47",
+        "--enable-auto-tool-choice",
+        "--disable-custom-all-reduce",
+        "--speculative-config",
+        "{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"draft_sample_method\":\"probabilistic\"}",
+        "--served-model-name",
+        "${SERVED_NAME}",
+        "--max-model-len",
+        "204800",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000"
+      ],
+      "restart": "no",
+      "deploy": {
+        "resources": {
+          "reservations": {
+            "devices": [
+              {
+                "driver": "nvidia",
+                "device_ids": ["0", "1"],
+                "capabilities": ["gpu"]
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

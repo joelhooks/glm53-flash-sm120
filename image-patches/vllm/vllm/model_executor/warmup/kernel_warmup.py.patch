@@ -1,0 +1,56 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+index d95befc8e..1c90e740a 100644
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -23,6 +23,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
+     warmup_b12x_tensor_fp8_linear,
+ )
+ from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe_dynamic
++from vllm.model_executor.layers.quantization.exl3 import (
++    warmup_exl3_mixed_trellis_route_pack,
++)
+ from vllm.model_executor.warmup.b12x_sparse_indexer_warmup import (
+     warmup_b12x_sparse_indexer,
+ )
+@@ -52,6 +55,9 @@ from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
+ from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
+     sparse_mla_triton_warmup,
+ )
++from vllm.model_executor.warmup.spec_decode_rejection_warmup import (
++    spec_decode_rejection_warmup,
++)
+ from vllm.model_executor.warmup.v1_block_table_warmup import (
+     warm_v1_block_table_kernels,
+ )
+@@ -352,6 +358,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool
+         kimi_k3_triton_warmup(worker)
+         fa4_cutedsl_warmup(worker)
+         sparse_mla_triton_warmup(worker)
++        spec_decode_rejection_warmup(worker)
+ 
+     if current_platform.has_device_capability(90):
+         _warmup_ll_bf16_router_gemm(worker.get_model())
+@@ -464,6 +471,16 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool
+         max_tokens=max(moe_token_counts),
+         token_counts=moe_token_counts,
+     )
++    free_before_exl3_warmup = torch.cuda.mem_get_info()[0]
++    warmed_exl3_route_pack = warmup_exl3_mixed_trellis_route_pack(worker.get_model())
++    if warmed_exl3_route_pack:
++        free_after_exl3_warmup = torch.cuda.mem_get_info()[0]
++        logger.info(
++            "Warmed up %d EXL3 mixed-Trellis route-pack variant(s); "
++            "free-memory delta %.1f MiB.",
++            warmed_exl3_route_pack,
++            (free_before_exl3_warmup - free_after_exl3_warmup) / (1 << 20),
++        )
+ 
+     minimax_m3_msa_warmup(worker)
+ 

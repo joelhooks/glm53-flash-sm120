@@ -1,0 +1,109 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/b12x/attention/_shared/mla/api.py b/b12x/attention/_shared/mla/api.py
+index 9dc229a..3a4a957 100644
+--- a/b12x/attention/_shared/mla/api.py
++++ b/b12x/attention/_shared/mla/api.py
+@@ -26,6 +26,11 @@ _MLA_FORCE_SPLIT_ENV = "B12X_MLA_FORCE_SPLIT"
+ _MLA_SM120_BACKEND = "sm120"
+ # GLM_NSA uncompressed decode contract (q_head_dim = d_nope+d_rope = 512+64).
+ _MLA_UNIFIED_GLM_Q_HEAD_DIM = 576
++# GLM_NOPE contract (q_head_dim = kv_lora_rank 512 + qk_rope_head_dim 0).
++_MLA_NOPE_Q_HEAD_DIM = 512
++# GLM_NOPE NVFP4 record widths: 288 B latent-only, 304 B with the per-token
++# fp32 latent scale. Neither can collide with GLM_NSA's 368/432.
++_NOPE_RECORD_BYTES = (288, 304)
+ _MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
+ _MLA_SINGLE_PASS_TARGET_TOPK = 2048
+ _LN2 = math.log(2.0)
+@@ -598,38 +603,52 @@ def _run_sparse_mla(
+         # is therefore the authoritative process-lifetime ABI at this boundary;
+         # derive the specialization from it instead of rereading a mutable env.
+         record_bytes = int(kv_cache.shape[-1])
+-        if record_bytes not in (368, 432):
++        if record_bytes in _NOPE_RECORD_BYTES:
++            # GLM_NOPE has no RoPE sub-record, so there is no fp8-rope variant
++            # to select: the width alone (288 vs 304) picks the per-token scale.
++            fp8_rope_for_call = False
++        elif record_bytes in (368, 432):
++            fp8_rope_for_call = record_bytes == 368
++        else:
+             raise ValueError(
+-                "NVFP4 sparse MLA cache record must be 368 or 432 bytes, got "
+-                f"{record_bytes}"
++                "NVFP4 sparse MLA cache record must be 368 or 432 bytes "
++                f"(GLM_NSA) or 288 or 304 bytes (GLM_NOPE), got {record_bytes}"
+             )
+-        fp8_rope_for_call = record_bytes == 368
+     else:
+         fp8_rope_for_call = _resolve_kv_fp8_rope(fp8_rope)
+     if int(scale_format_for_call or -1) == 2:
+-        expected_record_bytes = 368 if fp8_rope_for_call else 432
+-        if int(kv_cache.shape[-1]) != expected_record_bytes:
+-            raise ValueError(
+-                "NVFP4 sparse MLA cache record disagrees with KV_FP8_ROPE: "
+-                f"got {int(kv_cache.shape[-1])} bytes, expected "
+-                f"{expected_record_bytes}"
+-            )
++        record_bytes = int(kv_cache.shape[-1])
++        if record_bytes in _NOPE_RECORD_BYTES:
++            if fp8_rope_for_call:
++                raise ValueError(
++                    "KV_FP8_ROPE is meaningless for the GLM_NOPE NVFP4 record "
++                    f"({record_bytes} bytes): qk_rope_head_dim == 0"
++                )
++        else:
++            expected_record_bytes = 368 if fp8_rope_for_call else 432
++            if record_bytes != expected_record_bytes:
++                raise ValueError(
++                    "NVFP4 sparse MLA cache record disagrees with KV_FP8_ROPE: "
++                    f"got {record_bytes} bytes, expected {expected_record_bytes}"
++                )
+         if not _sm120_route:
+             raise NotImplementedError(
+                 "NVFP4 sparse MLA requires the active SM120 kernel path"
+             )
+-    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
+-    # the NVFP4 fp8-rope 368-byte record ONLY.
++    # FAIL-CLOSED: the per-token fp32 latent scale lives only in the widened
++    # NVFP4 record -- bytes [292, 296) of the GLM_NSA fp8-rope 368-byte record,
++    # or bytes [288, 292) of the GLM_NOPE 304-byte record.
+     if latent_scale_per_token:
+         if int(scale_format_for_call or -1) != 2:
+             raise ValueError(
+                 "sparse MLA latent_scale_per_token requires the NVFP4 cache "
+                 f"(scale_format=2); got scale_format={scale_format_for_call!r}"
+             )
+-        if int(kv_cache.shape[-1]) != 368:
++        if int(kv_cache.shape[-1]) not in (368, 304):
+             raise ValueError(
+                 "sparse MLA latent_scale_per_token requires the fp8-rope "
+-                f"368-byte NVFP4 record; got {int(kv_cache.shape[-1])} bytes"
++                "368-byte NVFP4 record or the 304-byte GLM_NOPE record; got "
++                f"{int(kv_cache.shape[-1])} bytes"
+             )
+     if attn_sink is not None:
+         attn_sink = attn_sink.detach()
+@@ -684,10 +703,15 @@ def _run_sparse_mla(
+         )
+     if _sm120_route:
+         q_head_dim = int(q_all.shape[-1])
+-        if q_head_dim != _MLA_UNIFIED_GLM_Q_HEAD_DIM:
++        if q_head_dim not in (_MLA_UNIFIED_GLM_Q_HEAD_DIM, _MLA_NOPE_Q_HEAD_DIM):
++            # 512 is admitted for GLM_NOPE (kv_lora_rank 512 + rope 0). It is
++            # also DSV4's width, but that ambiguity is resolved downstream by
++            # infer_model_type() on the NVFP4 record byte width, not here.
+             raise ValueError(
+                 f"SM120 sparse MLA decode requires the GLM_NSA contract "
+-                f"(q_head_dim={_MLA_UNIFIED_GLM_Q_HEAD_DIM}); got q_head_dim={q_head_dim}"
++                f"(q_head_dim={_MLA_UNIFIED_GLM_Q_HEAD_DIM}) or the GLM_NOPE "
++                f"contract (q_head_dim={_MLA_NOPE_Q_HEAD_DIM}); "
++                f"got q_head_dim={q_head_dim}"
+             )
+         if workspace.mode in ("extend", "verify", "draft_extend"):
+             return _run_sm120_prefill(

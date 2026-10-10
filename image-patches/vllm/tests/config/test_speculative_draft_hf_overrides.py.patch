@@ -1,0 +1,92 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/config/test_speculative_draft_hf_overrides.py b/tests/config/test_speculative_draft_hf_overrides.py
+index 001679664..82f2ac122 100644
+--- a/tests/config/test_speculative_draft_hf_overrides.py
++++ b/tests/config/test_speculative_draft_hf_overrides.py
+@@ -136,43 +136,74 @@ def test_composed_override_is_picklable():
+ 
+ 
+ @pytest.mark.cpu_test
+-def test_mtp_same_model_inherits_target_revisions():
++@pytest.mark.parametrize("method", ["mtp", "dspark"])
++def test_in_checkpoint_draft_inherits_target_identity(method):
+     spec = SimpleNamespace(
+-        method="mtp",
++        method=method,
+         model="org/model",
+         revision=None,
+         code_revision=None,
++        quantization=None,
+         target_model_config=SimpleNamespace(
+             model="org/model",
+             revision="weights-commit",
+             code_revision="code-commit",
++            quantization="deepseek_v4_fp8",
+         ),
+     )
+ 
+-    SpeculativeConfig._inherit_target_revision_for_mtp(spec)
++    SpeculativeConfig._inherit_target_identity_for_in_checkpoint_draft(spec)
+ 
+     assert spec.revision == "weights-commit"
+     assert spec.code_revision == "code-commit"
++    assert spec.quantization == "deepseek_v4_fp8"
+ 
+ 
+ @pytest.mark.cpu_test
+-def test_mtp_explicit_draft_revisions_are_preserved():
++@pytest.mark.parametrize("method", ["mtp", "dspark"])
++def test_in_checkpoint_draft_preserves_explicit_identity(method):
+     spec = SimpleNamespace(
+-        method="mtp",
++        method=method,
+         model="org/model",
+         revision="draft-weights",
+         code_revision="draft-code",
++        quantization="draft-quantization",
+         target_model_config=SimpleNamespace(
+             model="org/model",
+             revision="target-weights",
+             code_revision="target-code",
++            quantization="target-quantization",
+         ),
+     )
+ 
+-    SpeculativeConfig._inherit_target_revision_for_mtp(spec)
++    SpeculativeConfig._inherit_target_identity_for_in_checkpoint_draft(spec)
+ 
+     assert spec.revision == "draft-weights"
+     assert spec.code_revision == "draft-code"
++    assert spec.quantization == "draft-quantization"
++
++
++@pytest.mark.cpu_test
++def test_external_dspark_keeps_its_own_identity():
++    spec = SimpleNamespace(
++        method="dspark",
++        model="org/dspark",
++        revision=None,
++        code_revision=None,
++        quantization=None,
++        target_model_config=SimpleNamespace(
++            model="org/target",
++            revision="target-weights",
++            code_revision="target-code",
++            quantization="target-quantization",
++        ),
++    )
++
++    SpeculativeConfig._inherit_target_identity_for_in_checkpoint_draft(spec)
++
++    assert spec.revision is None
++    assert spec.code_revision is None
++    assert spec.quantization is None
+ 
+ 
+ @pytest.mark.cpu_test

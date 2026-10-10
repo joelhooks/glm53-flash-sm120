@@ -1,0 +1,135 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/b12x/attention/_shared/mla/io_mg.py b/b12x/attention/_shared/mla/io_mg.py
+index 2ace3ee..cef05da 100644
+--- a/b12x/attention/_shared/mla/io_mg.py
++++ b/b12x/attention/_shared/mla/io_mg.py
+@@ -39,6 +39,42 @@ _GLM_NOPE_SCALE_BYTES = 528
+ _NVFP4_IO_STRIDE = 432
+ _NVFP4_NOPE_SCALE_BYTES = 288
+ _NVFP4_FP8_ROPE_IO_STRIDE = 368
++# GLM_NOPE (qk_rope_head_dim == 0): the record is the strict [0, 288) prefix of
++# the NVFP4 record -- no RoPE tail at all -- optionally plus the fp32 per-token
++# latent scale at [288, 292) and 12B of 16B-align pad. The 288B NoPE+scales
++# payload is unchanged; ONLY the per-token record stride differs (288/304, not
++# 432). MG already stages just that payload and reads no rope, so the stride is
++# the whole divergence here.
++_NVFP4_NO_ROPE_IO_STRIDE = 288
++_NVFP4_NO_ROPE_PTS_IO_STRIDE = 304
++# 8B-aligned source of the fp32 per-token latent-scale word pair (both records).
++_NVFP4_LATENT_SCALE_SRC = 288
++
++
++def _nvfp4_record_stride(
++    kv_gmem_stride: int,
++    fp8_rope: bool,
++    per_token_latent_scale: bool,
++    d_rope: int,
++) -> int:
++    """Resolve the NVFP4 per-token gmem record stride at TRACE time (Python).
++
++    ``kv_gmem_stride`` (0 == unspecified) is AUTHORITATIVE when supplied, so a
++    caller can thread ``traits.kv_gmem_stride`` straight through for every
++    model. Otherwise the stride is derived: ``d_rope == 0`` selects the
++    rope-less GLM_NOPE record (288, or 304 with the per-token latent scale) and
++    ``d_rope < 0`` means "unspecified", which keeps the historical rope-bearing
++    derivation (368 with the fp8 rope tail, else 432) byte-identical.
++    """
++    if kv_gmem_stride:
++        return int(kv_gmem_stride)
++    if int(d_rope) == 0:
++        return (
++            _NVFP4_NO_ROPE_PTS_IO_STRIDE
++            if per_token_latent_scale
++            else _NVFP4_NO_ROPE_IO_STRIDE
++        )
++    return _NVFP4_FP8_ROPE_IO_STRIDE if fp8_rope else _NVFP4_IO_STRIDE
+ 
+ 
+ @cute.jit
+@@ -148,6 +184,8 @@ def io_issue_gather_glm_mg(
+     fp8_rope: cutlass.Constexpr = False,
+     per_token_latent_scale: cutlass.Constexpr = False,
+     kv_sc_dst_addr: Int32 = Int32(0),
++    d_rope: cutlass.Constexpr = -1,  # traits.d_rope; 0 == GLM_NOPE, -1 == unset
++    kv_gmem_stride: cutlass.Constexpr = 0,  # 0 == derive; else traits.kv_gmem_stride
+ ):
+     """Gather one BI=64 GLM prefill tile into MG smem.
+ 
+@@ -160,25 +198,31 @@ def io_issue_gather_glm_mg(
+     MG convention): the leader arrives + expect_tx over the BI 528B bulks.
+ 
+     ``scale_format`` (const_expr): ARBITRARY_FP32 (1, GLM 656B/528B) or
+-    NVFP4_E4M3 (2, NVFP4 432B/288B) record geometry."""
++    NVFP4_E4M3 (2, NVFP4 432B/368B/304B/288B) record geometry. The staged
++    payload is the same 288B NoPE+scales row for every NVFP4 variant; only the
++    per-token RECORD STRIDE differs, so it is threaded in from the traits
++    (``kv_gmem_stride`` / ``d_rope``) instead of being pinned to 432."""
+     if cutlass.const_expr(scale_format == 2):
+-        if cutlass.const_expr(fp8_rope):
+-            _ios = Int64(_NVFP4_FP8_ROPE_IO_STRIDE)
+-        else:
+-            _ios = Int64(_NVFP4_IO_STRIDE)
++        _ios = Int64(
++            _nvfp4_record_stride(
++                kv_gmem_stride, fp8_rope, per_token_latent_scale, d_rope
++            )
++        )
+         _nope = Int32(_NVFP4_NOPE_SCALE_BYTES)
+     else:
+         _ios = Int64(_GLM_IO_STRIDE)
+         _nope = Int32(_GLM_NOPE_SCALE_BYTES)
+ 
+-    if cutlass.const_expr(
+-        scale_format == 2 and fp8_rope and per_token_latent_scale
+-    ):
+-        # NVFP4 two-level record: scalar-gather the per-token fp32 latent
+-        # scale ([292, 296); loaded as the second word of the 8-aligned pair
+-        # at [288, 296)) into the contiguous smem kv_sc buffer -- the MG
+-        # analogue of the DSV4 footer gather above.  The fence orders these
+-        # stores before the leader's arrive, exactly like the DSV4 path.
++    if cutlass.const_expr(scale_format == 2 and per_token_latent_scale):
++        # NVFP4 two-level record: scalar-gather the per-token fp32 latent scale
++        # into the contiguous smem kv_sc buffer that smem_mg.py allocates for
++        # latent_scale_per_token -- the MG analogue of the DSV4 footer gather
++        # above. The fence orders these stores before the leader's arrive,
++        # exactly like the DSV4 path. The 8-aligned word pair at [288, 296)
++        # covers both records; only the kept word differs:
++        #   fp8-rope 368B: [288,292) rope scale, [292,296) latent -> f1
++        #   NoPE     304B: [288,292) latent,     [292,296) pad     -> f0
++        # (Gating this on fp8_rope left GLM_NOPE's kv_sc buffer uninitialized.)
+         eo = Int32(0)
+         for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
+             entry = eo + io_lane
+@@ -187,6 +231,7 @@ def io_issue_gather_glm_mg(
+                 idx_raw = Int32(-1)
+                 if cand_pos < g_end:
+                     idx_raw = Int32(topk_indices[cand_pos])
++                f0 = Uint32(0)
+                 f1 = Uint32(0)
+                 if idx_raw >= Int32(0):
+                     block_idx = idx_raw // page_block_size
+@@ -194,12 +239,15 @@ def io_issue_gather_glm_mg(
+                     scale_base_off = (
+                         Int64(block_idx) * stride_kv_block
+                         + Int64(local_idx) * _ios
+-                        + Int64(288)
++                        + Int64(_NVFP4_LATENT_SCALE_SRC)
+                     )
+-                    _, f1 = ld_global_nc_v2_u32(
++                    f0, f1 = ld_global_nc_v2_u32(
+                         get_ptr_as_int64(kv_cache_u8, scale_base_off)
+                     )
+-                st_shared_u32(kv_sc_dst_addr + entry * Int32(4), f1)
++                if cutlass.const_expr(fp8_rope):
++                    st_shared_u32(kv_sc_dst_addr + entry * Int32(4), f1)
++                else:
++                    st_shared_u32(kv_sc_dst_addr + entry * Int32(4), f0)
+             eo += Int32(io_threads)
+         cute.arch.fence_acq_rel_cta()
+ 

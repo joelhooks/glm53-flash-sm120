@@ -1,0 +1,97 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/distributed/test_b12x_fused_all_reduce.py b/tests/distributed/test_b12x_fused_all_reduce.py
+index f0f2068d6..99de40a00 100644
+--- a/tests/distributed/test_b12x_fused_all_reduce.py
++++ b/tests/distributed/test_b12x_fused_all_reduce.py
+@@ -33,6 +33,7 @@ from vllm.distributed.device_communicators.custom_all_reduce import (
+     _b12x_pcie_allreduce_max_size,
+     _b12x_pcie_dma_min_bytes,
+     _b12x_pcie_oneshot_limits,
++    _b12x_pcie_plain_route_generic_max_size,
+     _load_b12x_pcie_recommended_max_bytes,
+     get_b12x_pcie_allreduce,
+ )
+@@ -82,6 +83,7 @@ def make_b12x_custom_allreduce(
+     custom_allreduce._pcie_capture_stream = None
+     custom_allreduce._pcie_capture_channel_id = None
+     custom_allreduce._pcie_allreduce_max_size = allreduce_max_size
++    custom_allreduce._pcie_plain_route_generic_max_size = None
+     custom_allreduce._pcie_fused_add_rms_norm_max_size = fused_max_size
+     custom_allreduce._pcie_logged_first_allreduce = False
+     custom_allreduce._IS_CAPTURING = False
+@@ -188,6 +190,38 @@ def test_b12x_hierarchical_allreduce_dispatches_above_world_size_eight() -> None
+     runtime.for_stream.return_value.should_allreduce.assert_called_once_with(inp)
+ 
+ 
++def test_b12x_auto_policy_uses_runtime_plain_route() -> None:
++    custom_allreduce, runtime = make_b12x_custom_allreduce(
++        allreduce_max_size=4 * 1024 * 1024,
++        fused_max_size=84 * 1024,
++    )
++    custom_allreduce._pcie_plain_route_generic_max_size = 84 * 1024
++    channel = runtime.for_stream.return_value
++    channel.should_route_plain_allreduce.return_value = False
++    inp = torch.empty((32, 4096), dtype=torch.bfloat16)
++
++    assert not custom_allreduce.should_custom_ar(inp)
++    channel.should_route_plain_allreduce.assert_called_once_with(
++        inp,
++        generic_max_bytes=84 * 1024,
++    )
++    channel.should_allreduce.assert_not_called()
++
++
++def test_b12x_numeric_limit_bypasses_runtime_plain_route() -> None:
++    custom_allreduce, runtime = make_b12x_custom_allreduce(
++        allreduce_max_size=4 * 1024 * 1024,
++        fused_max_size=84 * 1024,
++    )
++    channel = runtime.for_stream.return_value
++    channel.should_allreduce.return_value = True
++    inp = torch.empty((32, 4096), dtype=torch.bfloat16)
++
++    assert custom_allreduce.should_custom_ar(inp)
++    channel.should_route_plain_allreduce.assert_not_called()
++    channel.should_allreduce.assert_called_once_with(inp)
++
++
+ def test_b12x_fused_allreduce_falls_back_above_its_cutoff() -> None:
+     custom_allreduce, runtime = make_b12x_custom_allreduce(
+         allreduce_max_size=64,
+@@ -470,6 +504,30 @@ def test_b12x_allreduce_limit_preserves_explicit_operator_value(
+     recommender.assert_not_called()
+ 
+ 
++def test_b12x_allreduce_auto_literal_uses_shape_policy(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "auto")
++    recommender = MagicMock(return_value=4 * 1024 * 1024)
++    monkeypatch.setattr(
++        custom_all_reduce,
++        "_load_b12x_pcie_recommended_max_bytes",
++        lambda: recommender,
++    )
++
++    assert _b12x_pcie_allreduce_max_size(2) == 4 * 1024 * 1024
++    assert _b12x_pcie_plain_route_generic_max_size() == 84 * 1024
++    recommender.assert_called_once_with(2, default=84 * 1024)
++
++
++def test_b12x_numeric_limit_disables_shape_policy(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "4MB")
++
++    assert _b12x_pcie_plain_route_generic_max_size() is None
++
++
+ def test_b12x_allreduce_limit_uses_vllm_default_without_b12x_policy(
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:

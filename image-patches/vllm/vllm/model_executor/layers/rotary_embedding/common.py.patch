@@ -1,0 +1,48 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/model_executor/layers/rotary_embedding/common.py b/vllm/model_executor/layers/rotary_embedding/common.py
+index 17cf66b02..da9d9c9fc 100644
+--- a/vllm/model_executor/layers/rotary_embedding/common.py
++++ b/vllm/model_executor/layers/rotary_embedding/common.py
+@@ -135,8 +135,13 @@ class ApplyRotaryEmb(CustomOp):
+         self.is_neox_style = is_neox_style
+         self.enable_fp32_compute = enable_fp32_compute
+ 
++        self.apply_rotary_emb_vllm_flash_attn = None
+         self.apply_rotary_emb_flash_attn = None
+         if not current_platform.is_cpu():
++            with suppress(ModuleNotFoundError):
++                self.apply_rotary_emb_vllm_flash_attn = import_module(
++                    "vllm.vllm_flash_attn.layers.rotary"
++                ).apply_rotary_emb
+             with suppress(ModuleNotFoundError):
+                 self.apply_rotary_emb_flash_attn = import_module(
+                     "flash_attn.ops.triton.rotary"
+@@ -232,7 +237,12 @@ class ApplyRotaryEmb(CustomOp):
+         cos: torch.Tensor,
+         sin: torch.Tensor,
+     ) -> torch.Tensor:
+-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
++        if self.apply_rotary_emb_vllm_flash_attn is None:
++            logger.warning_once(
++                "The bundled vllm_flash_attn package does not provide "
++                "layers.rotary; using the native PyTorch rotary implementation."
++            )
++            return self.forward_native(x, cos, sin)
+ 
+         x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
+ 
+@@ -244,7 +254,7 @@ class ApplyRotaryEmb(CustomOp):
+             ...
+         """
+         interleaved = not self.is_neox_style
+-        output = apply_rotary_emb(x, cos, sin, interleaved)
++        output = self.apply_rotary_emb_vllm_flash_attn(x, cos, sin, interleaved)
+ 
+         output = self._post_process(output, origin_shape, origin_dtype)
+         return output

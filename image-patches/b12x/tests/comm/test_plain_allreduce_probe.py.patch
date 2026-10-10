@@ -1,0 +1,154 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/comm/test_plain_allreduce_probe.py b/tests/comm/test_plain_allreduce_probe.py
+new file mode 100644
+index 0000000..26b5651
+--- /dev/null
++++ b/tests/comm/test_plain_allreduce_probe.py
+@@ -0,0 +1,141 @@
++from __future__ import annotations
++
++import pytest
++import torch
++
++import b12x.comm.pcie.plain_allreduce_probe as probe
++from b12x.comm.pcie.plain_allreduce_probe import (
++    CalibrationPoint,
++    select_plain_allreduce_policy,
++)
++
++
++def _point(rows: int, custom_us: float, nccl_us: float) -> CalibrationPoint:
++    return CalibrationPoint(
++        rows=rows,
++        custom_median_us=custom_us,
++        custom_p95_us=custom_us,
++        nccl_median_us=nccl_us,
++        nccl_p95_us=nccl_us,
++    )
++
++
++def test_policy_selection_preserves_non_monotonic_winners() -> None:
++    policy = select_plain_allreduce_policy(
++        [
++            _point(1, 4.0, 8.0),
++            _point(2, 8.0, 7.0),
++            _point(4, 5.0, 8.0),
++            _point(8, 9.0, 8.0),
++        ],
++        world_size=4,
++        hidden_size=4096,
++        dtype=torch.bfloat16,
++        min_absolute_margin_us=0.25,
++        min_relative_margin=0.01,
++    )
++
++    assert policy.measured_rows == frozenset((1, 2, 4, 8))
++    assert policy.custom_rows == frozenset((1, 4))
++
++
++def test_policy_selection_routes_a_tie_to_nccl() -> None:
++    policy = select_plain_allreduce_policy(
++        [_point(8, 15.1, 15.3)],
++        world_size=4,
++        hidden_size=4096,
++        dtype=torch.bfloat16,
++        min_absolute_margin_us=0.25,
++        min_relative_margin=0.01,
++    )
++
++    assert not policy.custom_rows
++
++
++def test_policy_selection_requires_a_majority_of_trial_wins() -> None:
++    point = CalibrationPoint(
++        rows=8,
++        custom_median_us=5.0,
++        custom_p95_us=9.0,
++        nccl_median_us=8.0,
++        nccl_p95_us=8.0,
++        custom_trials_us=(5.0, 9.0, 9.0),
++        nccl_trials_us=(8.0, 8.0, 8.0),
++    )
++    policy = select_plain_allreduce_policy(
++        [point],
++        world_size=4,
++        hidden_size=4096,
++        dtype=torch.bfloat16,
++        min_absolute_margin_us=0.25,
++        min_relative_margin=0.01,
++    )
++
++    assert not policy.custom_rows
++
++
++def test_policy_selection_rejects_incorrect_or_duplicate_measurements() -> None:
++    incorrect = CalibrationPoint(1, 1.0, 2.0, 1.0, 2.0, correct=False)
++    with pytest.raises(ValueError, match="numerically invalid"):
++        select_plain_allreduce_policy(
++            [incorrect],
++            world_size=2,
++            hidden_size=4096,
++            dtype=torch.bfloat16,
++            min_absolute_margin_us=0.25,
++            min_relative_margin=0.01,
++        )
++
++    with pytest.raises(ValueError, match="unique"):
++        select_plain_allreduce_policy(
++            [_point(1, 1.0, 2.0), _point(1, 1.0, 2.0)],
++            world_size=2,
++            hidden_size=4096,
++            dtype=torch.bfloat16,
++            min_absolute_margin_us=0.25,
++            min_relative_margin=0.01,
++        )
++
++
++def test_transport_stabilization_warms_b12x_and_nccl_equally(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    calls = {"prepare": 0, "b12x": 0, "nccl": 0}
++
++    class FakePool:
++        def prepare_graph_all_reduce(self, inp: torch.Tensor) -> None:
++            calls["prepare"] += 1
++
++        def all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor) -> None:
++            calls["b12x"] += 1
++
++        def capture(self, stream: object):
++            return object()
++
++    def fake_nccl(inp: torch.Tensor) -> None:
++        calls["nccl"] += 1
++
++    def fake_measure(op, **kwargs):
++        assert kwargs["warmup"] == 512
++        assert kwargs["repeat"] == 1
++        assert kwargs["ops_per_sample"] == 8
++        op()
++        return 0.0, 0.0
++
++    monkeypatch.setattr(probe.dist, "all_reduce", fake_nccl)
++    monkeypatch.setattr(probe.dist, "barrier", lambda: None)
++    monkeypatch.setattr(probe.torch.cuda, "synchronize", lambda _device: None)
++    monkeypatch.setattr(probe, "_measure_graph", fake_measure)
++    tensor = torch.empty(1)
++
++    probe._stabilize_transports(
++        FakePool(),
++        tensor,
++        tensor,
++        tensor,
++        replays=512,
++        ops_per_replay=8,
++        device=torch.device("cpu"),
++    )
++
++    assert calls == {"prepare": 1, "b12x": 2, "nccl": 2}

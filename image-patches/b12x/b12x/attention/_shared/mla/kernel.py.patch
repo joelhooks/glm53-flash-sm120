@@ -1,0 +1,138 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/b12x at 36bce2c1552ba2d47dc09f20a6f64fbfc8ec4ff8 (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/b12x.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/b12x/attention/_shared/mla/kernel.py b/b12x/attention/_shared/mla/kernel.py
+index 53716d0..3eb202b 100644
+--- a/b12x/attention/_shared/mla/kernel.py
++++ b/b12x/attention/_shared/mla/kernel.py
+@@ -698,13 +698,19 @@ class UnifiedDecodeKernel:
+         st = smem.allocate(SharedStorage)
+ 
+         q_fp8_addr = shared_ptr_to_u32(st.q_fp8.data_ptr())
+-        q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
++        if cutlass.const_expr(t.d_rope > 0):
++            q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
++        else:
++            q_rope_addr = Int32(0)
+         kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
+         if cutlass.const_expr(t.has_extra_cache or t.latent_scale_per_token):
+             kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
+         else:
+             kv_sc_addr = Int32(0)
+-        kv_rope_addr = shared_ptr_to_u32(st.kv_rope.data_ptr())
++        if cutlass.const_expr(t.d_rope > 0):
++            kv_rope_addr = shared_ptr_to_u32(st.kv_rope.data_ptr())
++        else:
++            kv_rope_addr = Int32(0)
+         reduce_addr = shared_ptr_to_u32(st.reduce.data_ptr())
+         reduce_max_addr = reduce_addr + Int32(L.reduce_warp_max_off - L.reduce_off)
+         reduce_sum_addr = reduce_addr + Int32(L.reduce_warp_sum_off - L.reduce_off)
+@@ -1515,13 +1521,19 @@ class UnifiedDecodeKernel:
+         st = smem.allocate(SharedStorage)
+ 
+         q_fp8_addr = shared_ptr_to_u32(st.q_fp8.data_ptr())
+-        q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
++        if cutlass.const_expr(t.d_rope > 0):
++            q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
++        else:
++            q_rope_addr = Int32(0)
+         kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
+         if cutlass.const_expr(t.has_extra_cache or t.latent_scale_per_token):
+             kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
+         else:
+             kv_sc_addr = Int32(0)
+-        kv_rope_addr = shared_ptr_to_u32(st.kv_rope.data_ptr())
++        if cutlass.const_expr(t.d_rope > 0):
++            kv_rope_addr = shared_ptr_to_u32(st.kv_rope.data_ptr())
++        else:
++            kv_rope_addr = Int32(0)
+         reduce_addr = shared_ptr_to_u32(st.reduce.data_ptr())
+         reduce_max_addr = reduce_addr + Int32(L.reduce_warp_max_off - L.reduce_off)
+         reduce_sum_addr = reduce_addr + Int32(L.reduce_warp_sum_off - L.reduce_off)
+@@ -2322,14 +2334,18 @@ def _cache_block_stride_bytes(
+         COMPRESSED_MLA_BYTES_PER_TOKEN,
+     )
+ 
+-    if int(model_type) == int(ModelType.GLM_NSA):
+-        # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
+-        # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
++    if int(model_type) in (int(ModelType.GLM_NSA), int(ModelType.GLM_NOPE)):
++        # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32), 432B
++        # or 368B (GLM_NSA NVFP4), 288B or 304B (GLM_NOPE NVFP4).
++        # ``record_bytes`` comes from traits.kv_gmem_stride.
+         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
+         expected = int(page_size) * rec
+     else:
+         expected = int(page_size) * COMPRESSED_MLA_BYTES_PER_TOKEN
+-    if int(model_type) == int(ModelType.GLM_NSA) and cache.is_contiguous():
++    if (
++        int(model_type) in (int(ModelType.GLM_NSA), int(ModelType.GLM_NOPE))
++        and cache.is_contiguous()
++    ):
+         return expected
+     # Use the tensor's physical page stride for padded views.
+     if cache.ndim >= 2:
+@@ -2846,26 +2862,50 @@ def run_unified_decode(
+     h_blocks = h_blocks_full + (1 if rem_heads else 0)
+ 
+     model_type, compute_mode, scale_format = infer_model_type(
+-        q_head_dim, swa_k_cache.dtype
++        q_head_dim,
++        swa_k_cache.dtype,
++        # Only a byte-typed cache has a byte-meaningful trailing extent; that
++        # extent is what separates GLM_NOPE from DSV4 at q_head_dim == 512.
++        kv_record_bytes=(
++            int(swa_k_cache.shape[-1]) if swa_k_cache.dtype.itemsize == 1 else None
++        ),
+     )
+     if scale_format_override is not None:
+         scale_format = int(scale_format_override)
+     if scale_format == ScaleFormat.NVFP4_E4M3 and fp8_rope_override is None:
+         record_bytes = int(swa_k_cache.shape[-1])
+-        if record_bytes not in (368, 432):
+-            raise ValueError(
+-                f"NVFP4 cache record must be 368 or 432 bytes, got {record_bytes}"
+-            )
+-        fp8_rope_override = record_bytes == 368
+-    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
+-    # the NVFP4 fp8-rope 368-byte record ONLY.
++        if int(model_type) == int(ModelType.GLM_NOPE):
++            # A NoPE record has no RoPE tail at all, so fp8_rope is never
++            # meaningful here; 288 vs 304 selects the per-token latent scale.
++            if record_bytes not in (288, 304):
++                raise ValueError(
++                    "GLM_NOPE NVFP4 cache record must be 288 or 304 bytes, "
++                    f"got {record_bytes}"
++                )
++            fp8_rope_override = False
++        else:
++            if record_bytes not in (368, 432):
++                raise ValueError(
++                    f"NVFP4 cache record must be 368 or 432 bytes, got {record_bytes}"
++                )
++            fp8_rope_override = record_bytes == 368
++    # FAIL-CLOSED: the per-token fp32 latent scale lives only in the widened
++    # NVFP4 record -- bytes [292, 296) of the GLM_NSA fp8-rope 368-byte record,
++    # or bytes [288, 292) of the GLM_NOPE 304-byte record.
+     if latent_scale_per_token:
+         if scale_format != ScaleFormat.NVFP4_E4M3:
+             raise ValueError(
+                 "SM120 sparse MLA decode latent_scale_per_token requires "
+                 f"ScaleFormat.NVFP4_E4M3; got scale_format={int(scale_format)}"
+             )
+-        if not bool(fp8_rope_override):
++        if int(model_type) == int(ModelType.GLM_NOPE):
++            if int(swa_k_cache.shape[-1]) != 304:
++                raise ValueError(
++                    "SM120 sparse MLA decode latent_scale_per_token requires the "
++                    "304-byte GLM_NOPE NVFP4 record; got "
++                    f"{int(swa_k_cache.shape[-1])} bytes"
++                )
++        elif not bool(fp8_rope_override):
+             raise ValueError(
+                 "SM120 sparse MLA decode latent_scale_per_token requires the "
+                 "fp8-rope 368-byte NVFP4 record; got the 432-byte record"

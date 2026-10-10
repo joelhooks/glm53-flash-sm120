@@ -1,0 +1,48 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 0c4d05676..c1b79ef13 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -12,10 +12,7 @@ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.utils import record_function_or_nullcontext
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+-from vllm.v1.worker.gpu.cudagraph_utils import (
+-    BatchExecutionDescriptor,
+-    get_uniform_token_count,
+-)
++from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+@@ -25,6 +22,7 @@ from vllm.v1.worker.gpu.spec_decode.speculator import (
+     CUDAGraphCapturePhase,
+     DraftModelSpeculator,
+ )
++from vllm.v1.worker.utils import get_uniform_decode_token_count
+ 
+ logger = init_logger(__name__)
+ 
+@@ -252,13 +250,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                 self.max_num_reqs,
+             )
+ 
+-        # Uniform decode query lengths enable FULL graph replay.
+-        uniform_token_count = get_uniform_token_count(
++        # FULL graph replay is valid only when every request is decoding.
++        uniform_token_count = get_uniform_decode_token_count(
+             num_reqs,
+             # Use the actual number of tokens without padding added by
+             # the target model during FULL cudagraph.
+             num_tokens,
+             max_query_len,
++            input_batch.has_prefill,
+         )
+         with record_function_or_nullcontext("vllm:v2/speculator/prefill/dispatch"):
+             rebuild_prefill_attn_metadata = getattr(

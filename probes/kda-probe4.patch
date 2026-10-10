@@ -1,0 +1,254 @@
+--- a/vllm/models/glm5next/nvidia/kda.py
++++ b/vllm/models/glm5next/nvidia/kda.py
+@@ -43,6 +43,147 @@
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+ 
+ 
++# --- glm-xid31 probe (debug only; inert unless GLMX_KDA_PROBE=1) ---
++import os as _glmx_os
++
++from vllm.logger import init_logger as _glmx_init_logger
++
++_glmx_log = _glmx_init_logger("vllm.glmx_probe")
++_GLMX_PROBE = _glmx_os.environ.get("GLMX_KDA_PROBE") == "1"
++_glmx_checks = {"mixed": 0, "prefill": 0}
++
++
++def _glmx_head(values, n=12):
++    return values if len(values) <= 2 * n else values[:n] + ["..."] + values[-n:]
++
++
++def _glmx_probe_prefill(prefix, q_ns, cu, state_idx, has_init, recurrent_state,
++                        use_spec, spec_cu, spec_idx, q_spec, num_spec_decodes,
++                        non_spec_token_indx, spec_token_indx, num_actual_tokens):
++    """Check that the device-side metadata agrees with the tensors the chunk
++    kernel will size its buffers from. Syncs the device; debug only."""
++    cu_l = [int(x) for x in cu.tolist()]
++    idx = [int(x) for x in state_idx.reshape(-1).tolist()]
++    t = int(q_ns.shape[0])
++    slots = int(recurrent_state.shape[0])
++    problems = []
++    if not cu_l or cu_l[0] != 0 or any(b < a for a, b in zip(cu_l, cu_l[1:])):
++        problems.append("non_spec cu_seqlens not monotone from 0")
++    if cu_l and cu_l[-1] != t:
++        problems.append(f"non_spec cu_seqlens[-1]={cu_l[-1]} != q_ns tokens={t}")
++    if len(cu_l) - 1 != len(idx):
++        problems.append(f"non_spec seqs={len(cu_l) - 1} != state rows={len(idx)}")
++    if int(has_init.numel()) != len(idx):
++        problems.append(f"has_initial_state={int(has_init.numel())} != state rows={len(idx)}")
++    bad = [i for i in idx if not 0 <= i < slots]
++    if bad:
++        problems.append(f"non_spec state ids out of [0,{slots}): {_glmx_head(bad)}")
++    detail = {"layer": prefix, "num_actual_tokens": int(num_actual_tokens),
++              "q_ns_tokens": t, "non_spec_cu": _glmx_head(cu_l),
++              "non_spec_state_ids": _glmx_head(idx), "state_slots": slots}
++    if use_spec:
++        scu = [int(x) for x in spec_cu.tolist()]
++        sidx = spec_idx.tolist()
++        ts = int(q_spec.shape[0]) if q_spec is not None else -1
++        detail.update(spec_cu=scu, spec_state_ids=sidx, q_spec_tokens=ts,
++                      num_spec_decodes=int(num_spec_decodes))
++        if scu[-1] != ts:
++            problems.append(f"spec cu_seqlens[-1]={scu[-1]} != q_spec tokens={ts}")
++        if len(scu) - 1 != int(num_spec_decodes):
++            problems.append(f"spec seqs={len(scu) - 1} != num_spec_decodes={int(num_spec_decodes)}")
++        flat = [int(v) for row in sidx for v in (row if isinstance(row, list) else [row])]
++        over = [v for v in flat if v >= slots]
++        if over:
++            problems.append(f"spec state ids >= {slots}: {_glmx_head(over)}")
++        if any(v < 0 for v in flat):
++            detail["spec_negative_ids"] = sum(v < 0 for v in flat)
++    if non_spec_token_indx is not None and spec_token_indx is not None:
++        ns_n, sp_n = int(non_spec_token_indx.numel()), int(spec_token_indx.numel())
++        detail.update(non_spec_token_indx_n=ns_n, spec_token_indx_n=sp_n)
++        if ns_n + sp_n != int(num_actual_tokens):
++            problems.append(f"token split {ns_n}+{sp_n} != num_actual_tokens={int(num_actual_tokens)}")
++    key = "mixed" if use_spec else "prefill"
++    _glmx_checks[key] += 1
++    if problems:
++        _glmx_log.error("GLMX_PROBE violation %s: %s", problems, detail)
++        raise RuntimeError(f"GLMX probe: KDA prefill metadata inconsistent: {problems}")
++    if prefix.endswith(".0.self_attn") or _glmx_checks[key] <= 3 or _glmx_checks[key] % 500 == 0:
++        if _glmx_checks[key] <= 3 or _glmx_checks[key] % 500 == 0:
++            _glmx_log.warning("GLMX_PROBE ok %s #%d %s", key, _glmx_checks[key], detail)
++
++
++def _glmx_list(t):
++    return None if t is None else [int(x) for x in t.reshape(-1).tolist()]
++
++
++def _glmx_probe_entry(prefix, md, num_actual_tokens, rows, num_spec):
++    """Mixed spec+prefill steps only: sync at KDA layer entry so an earlier
++    asynchronous error surfaces tagged with this layer, then check the token
++    split and spec metadata values before any index_select runs."""
++    import torch
++    try:
++        torch.cuda.synchronize()
++    except Exception as error:
++        _glmx_log.error("GLMX_PROBE async error surfaced at ENTRY of %s: %s", prefix, error)
++        raise
++    n = int(num_actual_tokens)
++    spec = _glmx_list(md.spec_token_indx) or []
++    non = _glmx_list(md.non_spec_token_indx) or []
++    acc = _glmx_list(md.num_accepted_tokens)
++    detail = {"layer": prefix, "num_actual_tokens": n, "rows": int(rows),
++              "num_prefills": int(md.num_prefills), "num_decodes": int(md.num_decodes),
++              "num_spec_decodes": int(md.num_spec_decodes),
++              "spec_token_indx": _glmx_head(spec), "non_spec_token_indx": _glmx_head(non),
++              "spec_cu": _glmx_list(md.spec_query_start_loc),
++              "non_spec_cu": _glmx_head(_glmx_list(md.non_spec_query_start_loc) or []),
++              "spec_state_ids": md.spec_state_indices_tensor.tolist() if md.spec_state_indices_tensor is not None else None,
++              "non_spec_state_ids": _glmx_list(md.non_spec_state_indices_tensor),
++              "num_accepted_tokens": acc,
++              "spec_sequence_masks": _glmx_list(md.spec_sequence_masks),
++              "has_initial_state": _glmx_list(md.has_initial_state),
++              "md_id": id(md),
++              "stream": torch.cuda.current_stream().cuda_stream,
++              "ptrs": {name: (getattr(md, name).data_ptr() if getattr(md, name) is not None else None)
++                       for name in ("spec_state_indices_tensor", "spec_sequence_masks",
++                                    "num_accepted_tokens", "spec_token_indx",
++                                    "non_spec_token_indx", "spec_query_start_loc",
++                                    "non_spec_state_indices_tensor")}}
++    problems = []
++    every = spec + non
++    if any(not 0 <= i < n for i in every):
++        problems.append(f"token index outside [0,{n}): {_glmx_head([i for i in every if not 0 <= i < n])}")
++    if len(set(every)) != len(every):
++        problems.append("spec and non-spec token indices overlap or repeat")
++    if len(every) != n:
++        problems.append(f"token split {len(spec)}+{len(non)} != num_actual_tokens={n}")
++    if int(rows) < n:
++        problems.append(f"projection rows={int(rows)} < num_actual_tokens={n}")
++    if acc is not None and any(not 1 <= a <= num_spec + 1 for a in acc):
++        problems.append(f"num_accepted_tokens outside [1,{num_spec + 1}]: {acc}")
++    if problems:
++        _glmx_log.error("GLMX_PROBE entry violation %s: %s", problems, detail)
++        raise RuntimeError(f"GLMX probe: KDA entry metadata inconsistent: {problems}")
++    # Probe 4: log every KDA layer of a mixed step, with object identity and
++    # tensor pointers, to tell per-group metadata from in-flight overwrites.
++    _glmx_log.warning("GLMX_PROBE mixed-step %s", detail)
++
++
++_glmx_step = {"mixed": False}
++
++
++def glmx_sync_point(tag):
++    """Probe 3: on mixed spec+prefill steps, sync and tag any asynchronous
++    CUDA error with the sub-block that just ran (layer attention or MLP)."""
++    if not (_GLMX_PROBE and _glmx_step["mixed"]):
++        return
++    import torch
++    try:
++        torch.cuda.synchronize()
++    except Exception as error:
++        _glmx_log.error("GLMX_PROBE async error surfaced AFTER %s: %s", tag, error)
++        raise
++
++
+ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
+     """Merged projection with multiple replicated output shards.
+ 
+@@ -382,6 +523,15 @@
+         num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
+         num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
+         use_spec = spec_sequence_masks is not None and num_spec_decodes > 0
++        if _GLMX_PROBE and ".layers.0." in self.prefix:
++            _glmx_step["mixed"] = bool(use_spec and attn_metadata_narrowed.num_prefills > 0)
++        if _GLMX_PROBE and use_spec and attn_metadata_narrowed.num_prefills > 0:
++            _glmx_probe_entry(
++                self.prefix, attn_metadata_narrowed, num_actual_tokens,
++                qkv_proj_states.shape[0],
++                spec_state_indices_tensor.shape[-1] - 1
++                if spec_state_indices_tensor is not None else 0,
++            )
+         # Safe-gate checkpoints use the bounded sigmoid variant.
+         safe_gate = self.kda_safe_gate
+         lower_bound = self.kda_lower_bound
+@@ -447,6 +597,7 @@
+             qkv_spec = g1_spec = beta_spec = None
+             qkv_ns, g1_ns, beta_ns = qkv_proj_states, g1, beta
+ 
++        glmx_sync_point(f"{self.prefix} after token index_select")
+         # --- causal conv1d: spec (draft-verify) path ---
+         if use_spec:
+             assert spec_state_indices_tensor is not None
+@@ -465,6 +616,7 @@
+                 max_query_len=conv_mql,
+             )
+             q_spec, k_spec, v_spec = qkv_spec.split(self.local_projection_size, dim=-1)
++            glmx_sync_point(f"{self.prefix} after spec conv1d_update")
+ 
+         # --- causal conv1d: non-spec path (prefill or plain decode) ---
+         q_ns = k_ns = v_ns = None
+@@ -500,6 +652,7 @@
+         def _rearr(x):
+             return x.reshape(1, -1, self.local_num_heads, self.head_dim)
+ 
++        glmx_sync_point(f"{self.prefix} after non-spec conv1d")
+         # --- core attention: spec (draft-verify) path ---
+         core_attn_out_spec = None
+         # In a pure spec-verify step (no non-spec tokens) the recurrent kernel
+@@ -537,6 +690,7 @@
+                 lower_bound=lower_bound,
+             )
+ 
++        glmx_sync_point(f"{self.prefix} after spec fused_recurrent_kda")
+         # --- core attention: non-spec path (prefill or plain decode) ---
+         core_attn_out_non_spec = None
+         # Only the plain-decode recurrent kernel can write straight into the
+@@ -547,6 +701,15 @@
+             assert q_ns is not None
+             assert non_spec_state_indices_tensor is not None
+             assert has_initial_state is not None
++            if _GLMX_PROBE:
++                _glmx_probe_prefill(
++                    self.prefix, q_ns, non_spec_query_start_loc,
++                    non_spec_state_indices_tensor, has_initial_state,
++                    recurrent_state, use_spec, spec_query_start_loc,
++                    spec_state_indices_tensor,
++                    q_spec if use_spec else None, num_spec_decodes,
++                    non_spec_token_indx, spec_token_indx, num_actual_tokens,
++                )
+             initial_state = gather_initial_states(
+                 recurrent_state, non_spec_state_indices_tensor, has_initial_state
+             )
+@@ -576,6 +739,7 @@
+                 last_recurrent_state,
+                 non_spec_state_indices_tensor,
+             )
++            glmx_sync_point(f"{self.prefix} after chunk prefill + scatter_states")
+         elif attn_metadata_narrowed.num_decodes > 0:
+             assert non_spec_query_start_loc is not None
+             assert non_spec_state_indices_tensor is not None
+--- a/vllm/models/glm5next/nvidia/model.py
++++ b/vllm/models/glm5next/nvidia/model.py
+@@ -87,7 +87,7 @@
+ from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
+ 
+ from .attention import Glm5NextMLAAttention
+-from .kda import Glm5NextLinearAttention
++from .kda import Glm5NextLinearAttention, glmx_sync_point
+ from .multimodal import (
+     Glm5NextMultiModalProcessor,
+     Glm5NextProcessingInfo,
+@@ -475,10 +475,12 @@
+         if self.is_sequence_parallel:
+             x = sp_all_gather(x)[: positions.shape[0]]
+ 
++        glmx_sync_point(f"L{self.layer_idx} pre-attention")
+         x = self.self_attn(
+             hidden_states=x,
+             positions=positions,
+         )
++        glmx_sync_point(f"L{self.layer_idx} attention")
+ 
+         if self.is_sequence_parallel:
+             x = sp_reduce_scatter(x)
+@@ -501,6 +503,7 @@
+             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
+         else:
+             x = self.mlp(x)
++        glmx_sync_point(f"L{self.layer_idx} mlp")
+ 
+         # mHC end. The last mHC layer materializes its final hc_post (nothing
+         # to fuse with) then contracts; every other layer defers its hc_post to

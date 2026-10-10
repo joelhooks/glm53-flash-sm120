@@ -1,0 +1,47 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
+index fe3c7d592..275b932f5 100644
+--- a/vllm/model_executor/model_loader/utils.py
++++ b/vllm/model_executor/model_loader/utils.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Utilities for selecting and loading models."""
+ 
++import gc
+ import inspect
+ import warnings
+ from contextlib import contextmanager
+@@ -125,9 +126,24 @@ def process_weights_after_loading(
+             # the caching allocator, which starves the OS on UMA devices.
+             release_device_memory_under_pressure(target_device)
+ 
+-    # Initialize post-load attention weights for any attention layer and MM
+-    # encoder. NOTE: Happens after other modules so we can easily decompress
+-    # weights.
++    # Every fused MoE layer is prepared by now, so no further R7 ballast
++    # request can occur. The pool is never-read scratch that would otherwise
++    # stay resident for the process lifetime at the direct expense of KV
++    # cache. Released once, here: releasing per layer refragments the heap
++    # and OOMs the load. Inert unless the EXL3 R7 path allocated it.
++    try:
++        from vllm.model_executor.layers.quantization.exl3 import (
++            release_r7_ballast,
++        )
++
++        if release_r7_ballast():
++            gc.collect()
++            torch.cuda.empty_cache()
++    except Exception:  # noqa: BLE001 - never block model load on cleanup
++        logger.debug("EXL3 R7 ballast release skipped", exc_info=True)
++
++    # Initialize post-load attention weights after quantized weights have been
++    # decompressed or repacked.
+     for _, module in model.named_modules():
+         if is_deferred_attention_layer(module):
+             # TODO(lucas): see if there is a way to unify the signatures

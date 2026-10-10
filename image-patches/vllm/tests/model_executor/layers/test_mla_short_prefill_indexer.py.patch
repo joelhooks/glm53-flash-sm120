@@ -1,0 +1,57 @@
+# glm53-flash-sm120 attribution
+# Source: changes found in the published image verdictai/glm53-flash-exl3-k4@sha256:0f1cdcc8891f1cc3a444121eb61d366289a1cbba285f0892dcbb24bc94961692
+#   release r19-sm120-tp2-ep2-dcp2-v84-dflash2; release author per the image's
+#   /opt/glm53/PROVENANCE.json: Brandon M. Music. Not written by this project.
+# Applies to: https://github.com/local-inference-lab/vllm at 6dc2f516688fe6f84c6994dcd20fddf296853a6c (tracked files, git diff HEAD)
+# Licence: Apache-2.0, as the upstream project (see licenses/vllm.LICENSE).
+# Apply with: git apply <this file>
+diff --git a/tests/model_executor/layers/test_mla_short_prefill_indexer.py b/tests/model_executor/layers/test_mla_short_prefill_indexer.py
+index 6e1e10e8b..47bfcd0b3 100644
+--- a/tests/model_executor/layers/test_mla_short_prefill_indexer.py
++++ b/tests/model_executor/layers/test_mla_short_prefill_indexer.py
+@@ -8,6 +8,7 @@ import torch
+ 
+ import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
+ from vllm.config import CUDAGraphMode
++from vllm.models.deepseek_v32.attention import DeepseekV32Attention
+ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+ 
+ INDEXER_LAYER = "model.layers.0.self_attn.indexer.k_cache"
+@@ -45,7 +46,15 @@ def make_mla_metadata(*, use_dense_mha: bool = True, num_decode_tokens: int = 0)
+ 
+ @pytest.mark.parametrize(
+     "batch_kind",
+-    ["short", "threshold_mismatch", "force_mqa", "mla_decode", "capture", "full"],
++    [
++        "short",
++        "threshold_mismatch",
++        "mqa_only_layer",
++        "force_mqa",
++        "mla_decode",
++        "capture",
++        "full",
++    ],
+ )
+ def test_short_prefill_updates_k_cache_before_scoring_decision(
+     monkeypatch: pytest.MonkeyPatch,
+@@ -132,6 +141,11 @@ def test_short_prefill_updates_k_cache_before_scoring_decision(
+     topk_indices = torch.full((7, 2048), 17, dtype=torch.int32)
+ 
+     def run_indexer():
++        if batch_kind == "mqa_only_layer":
++            assert not DeepseekV32Attention.supports_dense_mha_prefill
++            dense_mha_layer = ""
++        else:
++            dense_mha_layer = MLA_LAYER
+         return sparse_indexer.sparse_attn_indexer(
+             hidden_states,
+             INDEXER_LAYER,
+@@ -149,7 +163,7 @@ def test_short_prefill_updates_k_cache_before_scoring_decision(
+             topk_indices,
+             False,
+             False,
+-            MLA_LAYER,
++            dense_mha_layer,
+         )
+ 
+     if should_skip:

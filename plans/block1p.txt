@@ -1,0 +1,5 @@
+# Block 1p: guarded persistent_topk (causal test + stopgap). Faults 0 with
+# GLMX_GUARD drops > 0 on mixed steps = causal.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+guard guard 2 21 8
+guard guard 2 22 8

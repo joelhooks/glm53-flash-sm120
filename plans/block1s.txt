@@ -1,0 +1,9 @@
+# Block 1s (revised 23:15Z, change of plan): prove the origin fix on the
+# production config (DCP=2, prefix caching, MTP). origin-fix = source + Mamba
+# block-table width not DCP-scaled; no probes, no top-k guard, no NaN-safe key.
+# Expect 0 faults over 16 waves. probe-fix shows slot reads and NaN (expect 0).
+# Dropped: a33 (dcp1), a27 (nankey), a28, a32; no longer change a decision.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+origin-fix baseline 2 34 8
+origin-fix baseline 2 35 8
+probe-fix probe 2 36 8

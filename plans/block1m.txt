@@ -1,0 +1,5 @@
+# Block 1m: memcheck with allocator caching off (every tensor its own cudaMalloc,
+# so a write into a neighbour is a real OOB), eager, util 0.95. Run with
+# GLMX_MEMCHECK_NOCACHE=1. Regex persistent_topk|FilteredTopK (the probe-8 window).
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+source memcheck-k 2 2 8

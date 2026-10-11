@@ -1,0 +1,4 @@
+# Block 1o: probe 10 (sentinel-padded pool_topk, logits invariance, dump on overrun).
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+probe probe 2 19 8
+probe probe 2 20 8

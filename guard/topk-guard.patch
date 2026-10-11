@@ -1,0 +1,71 @@
+Binary files a2/vllm/model_executor/layers/__pycache__/sparse_attn_indexer_kpool.cpython-314.pyc and m/vllm/model_executor/layers/__pycache__/sparse_attn_indexer_kpool.cpython-314.pyc differ
+--- a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+@@ -70,6 +70,49 @@
+ _KPOOL_B12X_PAGED_PREFILL_MIN_POOLS = 65_536
+ 
+ 
++# GLMX guard: with GLMX_TOPK_GUARD=1, route persistent_topk to the guarded
++# build (torch.ops.glmx, /opt/glmx/guard/glmx_topk.so), which bounds every
++# output write to [0, k) and counts dropped writes. The counter is copied to
++# pinned host memory without a sync and logged when it changes.
++import os as _glmx_os
++
++_GLMX_GUARD = _glmx_os.environ.get("GLMX_TOPK_GUARD") == "1"
++_glmx_guard = {"loaded": False, "host": None, "dev": None, "last": 0, "calls": 0}
++
++
++def _glmx_guard_poll(device):
++    import logging
++
++    g = _glmx_guard
++    g["calls"] += 1
++    if torch.cuda.is_current_stream_capturing():
++        return
++    if g["host"] is None:
++        g["host"] = torch.zeros(16, dtype=torch.int64, pin_memory=True)
++        g["dev"] = torch.zeros(16, dtype=torch.int64, device=device)
++    seen = g["host"].tolist()
++    if seen[0] != g["last"]:
++        logging.getLogger("vllm").error(
++            "GLMX_GUARD dropped writes: total=%d (+%d) call=%d first=[site=%d pos=%d val=%d "
++            "block=%d thread=%d seq_len=%d threshold_bin=%d remaining_k=%d output_count=%d "
++            "buffered0=%d buffered1=%d final_k=%d]",
++            seen[0], seen[0] - g["last"], g["calls"], *seen[1:13])
++        g["last"] = seen[0]
++    torch.ops.glmx.guard_stats(g["dev"])
++    g["host"].copy_(g["dev"], non_blocking=True)
++
++
++def _glmx_persistent_topk(logits, lengths, output, workspace, k, max_seq_len):
++    if not _GLMX_GUARD:
++        torch.ops._C.persistent_topk(logits, lengths, output, workspace, k, max_seq_len)
++        return
++    if not _glmx_guard["loaded"]:
++        torch.ops.load_library("/opt/glmx/guard/glmx_topk.so")
++        _glmx_guard["loaded"] = True
++    torch.ops.glmx.persistent_topk(logits, lengths, output, workspace, k, max_seq_len)
++    _glmx_guard_poll(logits.device)
++
++
+ def _can_use_b12x_kpool_prefill(
+     *,
+     use_b12x_sparse_indexer: bool,
+@@ -1026,7 +1069,7 @@
+                 (topk_workspace,) = workspace_manager.get_simultaneous(
+                     ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                 )
+-                torch.ops._C.persistent_topk(
++                _glmx_persistent_topk(
+                     logits,
+                     pool_seq_lens,
+                     pool_topk,
+@@ -1146,7 +1189,7 @@
+             (topk_workspace,) = workspace_manager.get_simultaneous(
+                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+             )
+-            torch.ops._C.persistent_topk(
++            _glmx_persistent_topk(
+                 logits,
+                 seq_lens,
+                 topk_dst,

@@ -1,0 +1,6 @@
+# Block 1h: probe 5 (snapshot GDN metadata at L0 KDA entry, compare after every
+# attention and MoE sub-block) to name the sub-block that overwrites it.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+probe probe 2 8 8
+probe probe 2 9 8
+probe probe 2 10 8

@@ -1,0 +1,6 @@
+# Block 1t: probe 12 (NaN origin in KDA layers 0-2, GDN slot selection), then
+# the same probe with prefix caching off (mamba cache mode none): causal test of
+# the align-mode spec state slots. Expect NaN 0 and faults 0 if U holds.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+probe probe 2 29 8
+probe probe-no-prefix-cache 2 31 8

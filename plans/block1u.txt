@@ -1,0 +1,6 @@
+# Block 1u: the production image glm-fixed (source + origin fix + NaN-safe top-k
+# key + bounded top-k writes, no probes, no debug env), production config.
+# Expect 0 faults over 16 waves.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+glm-fixed baseline 2 37 8
+glm-fixed baseline 2 38 8

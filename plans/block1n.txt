@@ -1,0 +1,4 @@
+# Block 1n: fallback memcheck with caching allocator and CUDA graphs on
+# (default memcheck-k), util 0.95, same regex. Runs after block 1m.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+source memcheck-k 2 3 8

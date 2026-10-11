@@ -25,7 +25,22 @@ IMAGES = {
     'source': os.environ.get('GLMX_TAG', 'glm53-flash-sm120:source'),
     # probes/Dockerfile: source plus inert-by-default debug probes.
     'probe': os.environ.get('GLMX_PROBE_TAG', 'glm53-flash-sm120:probe'),
+    # guard/Dockerfile: source plus a guarded persistent_topk (inert unless GLMX_TOPK_GUARD=1).
+    'guard': os.environ.get('GLMX_GUARD_TAG', 'glm53-flash-sm120:topk-guard'),
+    # guard/Dockerfile with GLMX_KEY_FIX=1: the same guard plus a NaN-safe fp32
+    # key (the fix candidate); with variant guard, drops should stay at 0.
+    'nankey': os.environ.get('GLMX_NANKEY_TAG', 'glm53-flash-sm120:topk-nankey'),
+    # fix/Dockerfile: source plus the origin fix only (Mamba block-table width
+    # not DCP-scaled). No probes, no top-k guard, no NaN-safe key.
+    'origin-fix': os.environ.get('GLMX_ORIGIN_FIX_TAG', 'glm53-flash-sm120:origin-fix'),
+    # probes/Dockerfile with kda-probe12-fix.patch: probe 12 plus the origin fix.
+    'probe-fix': os.environ.get('GLMX_PROBE_FIX_TAG', 'glm53-flash-sm120:probe-fix'),
+    # fix/prod/Dockerfile: production image. Origin fix plus the nankey top-k build
+    # (NaN-safe key, bounded writes) always on. No probes, no guard env, no debug env.
+    'glm-fixed': os.environ.get('GLMX_GLM_FIXED_TAG', 'glm53-flash-sm120:glm-fixed'),
 }
+# Layer-3 suspects: DSA indexer K pool, sparse_utils, b12x sparse MLA, top-k ops.
+MEMCHECK_REGEX = 'topk|kpool|expand_pools|gather_topk|global_index|ckv|page_table|prepare_uniform|mla|indexer'
 SANITIZER = ['/usr/local/cuda/bin/compute-sanitizer', '--target-processes', 'all',
              '--print-limit', '200', '--log-file', '/cache/sanitizer/%p.log']
 
@@ -81,9 +96,24 @@ VARIANTS = {
     # Async scheduling defaults on for MTP (vllm/config/vllm.py, EagleModelTypes).
     'no-async': ('Async scheduling off (--no-async-scheduling)',
                  lambda c, e: set_arg(c, '--no-async-scheduling'), None),
+    'memcheck-k': ('memcheck filtered to kernels matching GLMX_MEMCHECK_REGEX; CUDA graphs kept unless GLMX_MEMCHECK_NOCACHE=1',
+                   None, 'Sanitizer entrypoint; GLMX_MEMCHECK_NOCACHE=1 adds PYTORCH_NO_CUDA_MEMORY_CACHING=1 and --enforce-eager'),
+    'guard': ('GLMX_TOPK_GUARD=1: bounded persistent_topk output writes, dropped-write counter (guard image only)',
+              lambda c, e: e.update(GLMX_TOPK_GUARD='1'), 'Diagnostic stopgap, not the fix'),
     'probe-no-async': ('Probe plus async scheduling off',
                        lambda c, e: (e.update(GLMX_KDA_PROBE='1'), set_arg(c, '--no-async-scheduling')),
                        'Paired diagnostic: probe image and env, with --no-async-scheduling'),
+    # Prefix caching forces mamba cache mode 'align' (models/config.py), where the
+    # spec state slots are block-table columns; off, the mode is 'none'.
+    'probe-no-prefix-cache': ('Probe plus prefix caching off (mamba cache mode none)',
+                              lambda c, e: (e.update(GLMX_KDA_PROBE='1'),
+                                            drop_arg(c, '--enable-prefix-caching', False),
+                                            set_arg(c, '--no-enable-prefix-caching')),
+                              'Paired diagnostic: causal test of the align-mode state slots'),
+    'probe-dcp1': ('Probe plus decode context parallel 2 -> 1',
+                   lambda c, e: (e.update(GLMX_KDA_PROBE='1'), drop_arg(c, '--decode-context-parallel-size'),
+                                 drop_arg(c, '--dcp-comm-backend'), e.pop('VLLM_USE_B12X_DCP_A2A')),
+                   'Paired diagnostic: tests rank-local seq_lens against the mamba block table (W)'),
 }
 
 
@@ -107,6 +137,19 @@ def build(variant, image, port):
         set_arg(cmd, '--enforce-eager')
         env.update(CUDA_LAUNCH_BLOCKING='1', VLLM_LOGGING_LEVEL='DEBUG')
         server['entrypoint'] = SANITIZER+['--tool', 'memcheck', '/opt/venv/bin/vllm']
+    elif variant == 'memcheck-k':
+        # memcheck bounds are per CUDA allocation, so with caching on it reports
+        # writes outside the allocator's segments (the Xid 31 kind) but not into
+        # a neighbouring tensor. GLMX_MEMCHECK_NOCACHE=1 gives every tensor its
+        # own allocation; raw cudaMalloc can't run under graph capture, so eager.
+        if os.environ.get('GLMX_MEMCHECK_NOCACHE') == '1':
+            env.update(PYTORCH_NO_CUDA_MEMORY_CACHING='1')
+            set_arg(cmd, '--enforce-eager')
+        # The sanitizer takes ~2 GiB per GPU, so the default 0.986 fails startup.
+        set_arg(cmd, '--gpu-memory-utilization', os.environ.get('GLMX_MEMCHECK_GPU_UTIL', '0.95'))
+        server['entrypoint'] = SANITIZER+['--tool', 'memcheck', '--padding', '4096',
+                                          '--kernel-name', 'regex='+os.environ.get('GLMX_MEMCHECK_REGEX', MEMCHECK_REGEX),
+                                          '/opt/venv/bin/vllm']
     else:
         change(cmd, env)
     slug = 'glmx-'+variant

@@ -1,0 +1,6 @@
+# Block 1v: rerun after a35/a36/a37/a38 failed to start at 23:49Z (host /tmp out
+# of inodes). origin-fix second run, then glm-fixed x2. Production config.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+origin-fix baseline 2 39 8
+glm-fixed baseline 2 40 8
+glm-fixed baseline 2 41 8

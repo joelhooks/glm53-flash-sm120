@@ -72,44 +72,58 @@ status = json.loads((out/'client/status.json').read_text()) if (out/'client/stat
 gpus = (out/'final-gpus.txt').read_text().strip().splitlines()
 
 # Owner stop rule (2026-10-10): Xid 31 is allowed. Xid 43 is allowed only when
-# the engine logged a device-side assert or CUDA error within 10 s of it. Any
-# other Xid, an unmatched 43, or a missing GPU stops all GPU work.
+# the engine logged a device-side assert or CUDA error within 10 s of it. Xid 13
+# (widened 19:57Z) is allowed only with an engine illegal-memory-access error
+# within 10 s. Any other Xid, an unmatched 43 or 13, or a missing GPU stops all
+# GPU work.
 def kernel_time(line):
     m = re.match(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)[,.](\d+)([+-]\d\d:\d\d)', line)
     if not m:
         return None
     return datetime.datetime.fromisoformat(f'{m[1]}.{m[2][:6]}{m[3]}').astimezone(datetime.timezone.utc)
-engine_errors = []
+engine_errors, illegal_access = [], []
 log = out/'server.log'
 if log.exists():
     pattern = re.compile(r'device-side assert|illegal memory access|Triton Error \[CUDA\]|CUDA error|cudaError|AcceleratorError')
     for line in log.read_text(errors='replace').splitlines():
         m = re.search(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.(\d+)Z', line)
         if m and pattern.search(line):
-            engine_errors.append(datetime.datetime.fromisoformat(f'{m[1]}.{m[2][:6]}+00:00'))
-xid43 = []
-for line in xid_text.splitlines():
-    if re.search(r'Xid \(PCI:[^)]*\): 43\b', line):
-        when = kernel_time(line)
-        gap = min((abs((e-when).total_seconds()) for e in engine_errors), default=None) if when else None
-        xid43.append({'utc': when.isoformat() if when else None, 'nearest_engine_error_s': gap,
-                      'matched': gap is not None and gap <= 10})
-unmatched_43 = any(not x['matched'] for x in xid43)
-other = [c for c in codes if c not in (31, 43)]
-if other or unmatched_43:
+            t = datetime.datetime.fromisoformat(f'{m[1]}.{m[2][:6]}+00:00')
+            engine_errors.append(t)
+            if 'illegal memory access' in line:
+                illegal_access.append(t)
+def matched_xids(code, errors):
+    found = []
+    for line in xid_text.splitlines():
+        if re.search(r'Xid \(PCI:[^)]*\): %d\b' % code, line):
+            when = kernel_time(line)
+            gap = min((abs((e-when).total_seconds()) for e in errors), default=None) if when else None
+            found.append({'utc': when.isoformat() if when else None, 'nearest_engine_error_s': gap,
+                          'matched': gap is not None and gap <= 10})
+    return found
+xid43 = matched_xids(43, engine_errors)
+xid13 = matched_xids(13, illegal_access)
+unmatched = any(not x['matched'] for x in xid43 + xid13)
+other = [c for c in codes if c not in (13, 31, 43)]
+if other or unmatched:
     outcome = 'other_xid_STOP'
+elif 13 in codes:
+    outcome = 'xid13_illegal_access'
 elif 43 in codes:
     outcome = 'xid43_assert'
 elif codes:
     outcome = 'xid31'
 else:
     outcome = 'clean' if status.get('state') == 'wave_clean' else 'client_failure_no_xid' if status else 'startup_failure'
-result = {'outcome': outcome, 'xid_codes': codes, 'xid43': xid43, 'client_state': status.get('state'), 'gpus_after': gpus,
+result = {'outcome': outcome, 'xid_codes': codes, 'xid43': xid43,
+          'xid13_matched': sum(x['matched'] for x in xid13), 'xid13_unmatched': sum(not x['matched'] for x in xid13),
+          'client_state': status.get('state'), 'gpus_after': gpus,
           'gpu_count_ok': len(gpus) == 2, 'compute_clear': not (out/'final-compute.txt').read_text().strip()}
 (out/'outcome.json').write_text(json.dumps(result, indent=2)+'\n')
 print(json.dumps(result))
 if outcome == 'other_xid_STOP' or len(gpus) != 2:
-    (out/'STOP_GPU_WORK').write_text('Xid outside the stop rule (not 31, or 43 without an engine error within 10 s) '
+    (out/'STOP_GPU_WORK').write_text('Xid outside the stop rule (not 31; 43 without an engine error, or 13 without an '
+                                     'engine illegal-access error, within 10 s) '
                                      'or missing GPU: stop all GPU work and message the owner.\n')
 PY
   echo "Run finished: $out"
@@ -135,7 +149,7 @@ active=1; "${compose[@]}" up -d --pull never
 began=$(date +%s) healthy=0
 limit=1200
 # Under memcheck, model load and warm-up run many times slower.
-if [[ $variant == memcheck ]]; then limit=5400; fi
+if [[ $variant == memcheck* ]]; then limit=5400; fi
 while (( $(date +%s)-began < limit && $(date +%s) < end-600 )); do
   if stopped "$out" || [[ -n $("${compose[@]}" ps -aq --status exited) ]]; then break; fi
   if curl -fsS -m 5 http://127.0.0.1:8000/health >/dev/null; then healthy=1; break; fi

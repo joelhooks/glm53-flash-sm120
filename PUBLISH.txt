@@ -23,3 +23,9 @@ attribute-patches.py
 export-public.sh
 licenses/
 probes/
+fix/Dockerfile
+fix/origin-fix.patch
+fix/prod/
+guard/Dockerfile
+guard/make-guard.py
+guard/topk-guard.patch

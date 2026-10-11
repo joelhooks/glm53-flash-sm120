@@ -1,0 +1,5 @@
+# Block 1l: probe 9 (CUDA caching-allocator history; on a metadata change,
+# dump alloc/free events and Python stacks for the block holding the victim).
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+probe probe 2 17 8
+probe probe 2 18 8

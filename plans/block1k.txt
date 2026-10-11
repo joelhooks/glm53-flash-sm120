@@ -1,0 +1,8 @@
+# Block 1k: probe 8 (compare points between the kernels of the native KPool32
+# decode path: cache update, logits, persistent_topk / top_k_per_row_decode, DCP
+# merge, expand; plus shape and pool_topk range logs on mixed steps), then
+# memcheck filtered to the indexer kernels.
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+probe probe 2 15 8
+probe probe 2 16 8
+source memcheck-k 2 1 8

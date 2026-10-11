@@ -1,0 +1,20 @@
+diff -ruN a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-08-27 18:11:42.000000000 -0700
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-10-10 16:04:45.493583421 -0700
+@@ -600,8 +600,15 @@
+             # every rank instead.
+             group_cp_size = get_kv_cache_dcp_shard_count(spec, self.dcp_size)
+             group_cp_sizes.append(group_cp_size)
++            # glm-xid31 origin fix: Mamba state is replicated across DCP ranks
++            # and its blocks are position-indexed over the full sequence
++            # (align mode), so its block-table width must not be CP-scaled.
++            # With DCP=2 the scaled width was cdiv(max_len, 2 * block_size) + spec
++            # blocks, too narrow for start + num_speculative_blocks near
++            # max_len / 2, and the align-mode state selection read past the row.
++            width_cp_size = 1 if isinstance(spec, MambaSpec) else group_cp_size
+             max_num_blocks = cdiv(
+-                block_table_max_model_len, spec.block_size * group_cp_size
++                block_table_max_model_len, spec.block_size * width_cp_size
+             )
+             # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
+             if isinstance(spec, MambaSpec):

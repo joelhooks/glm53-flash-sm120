@@ -1,0 +1,7 @@
+# Block 1i: probe 6 (compare points inside layer-3 sparse MLA: pre-indexer,
+# indexer, mla_attn, then o_proj via "L3 attention"), then memcheck filtered
+# to the layer-3 kernels (caching on, CUDA graphs kept).
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+probe probe 2 11 8
+probe probe 2 12 8
+source memcheck-k 2 1 8

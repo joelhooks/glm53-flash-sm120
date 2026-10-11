@@ -1,0 +1,7 @@
+# Block 1j: probe 7 (compare points inside the DSA indexer: cache insert, fill,
+# prefill b12x top-k / top_k_per_row / DCP merge, prefill end, decode paths),
+# then memcheck filtered to the indexer kernels (GLMX_MEMCHECK_REGEX in lab.env).
+# IMAGE VARIANT SESSIONS ATTEMPT WAVES
+probe probe 2 13 8
+probe probe 2 14 8
+source memcheck-k 2 1 8

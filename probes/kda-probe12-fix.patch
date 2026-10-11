@@ -1,0 +1,928 @@
+diff -ruN a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.py
+--- a/vllm/model_executor/layers/mla.py	2026-10-10 11:44:43.345435454 -0700
++++ b/vllm/model_executor/layers/mla.py	2026-10-10 11:44:49.836063522 -0700
+@@ -294,6 +294,18 @@
+     return scales
+ 
+ 
++# GLMX probe 6: compare points inside sparse MLA (inert unless GLMX_KDA_PROBE=1).
++import os as _glmx_os
++
++_GLMX_PROBE = _glmx_os.environ.get("GLMX_KDA_PROBE") == "1"
++
++
++def _glmx_sync(tag):
++    from vllm.models.glm5next.nvidia.kda import glmx_sync_point
++
++    glmx_sync_point(tag)
++
++
+ @dataclass
+ class MLAModules:
+     """Modules used in MLA."""
+@@ -562,8 +574,12 @@
+                 f"dtype={k_pe.dtype}, shape={tuple(k_pe.shape)}"
+             )
+ 
++        if _GLMX_PROBE:
++            _glmx_sync("MLA pre-indexer")
+         if self.indexer and self.is_sparse and not self.skip_topk:
+             self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
++            if _GLMX_PROBE:
++                _glmx_sync("MLA indexer")
+ 
+         if llama_4_scaling is not None:
+             q *= llama_4_scaling
+@@ -579,6 +595,8 @@
+             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+             q_dcp_replicated=q_dcp_replicated,
+         )
++        if _GLMX_PROBE:
++            _glmx_sync("MLA attn")
+ 
+         if self.g_proj is not None:
+             attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
+Binary files a3/vllm/model_executor/layers/__pycache__/mla.cpython-314.pyc and o/vllm/model_executor/layers/__pycache__/mla.cpython-314.pyc differ
+Binary files a3/vllm/model_executor/layers/__pycache__/sparse_attn_indexer_kpool.cpython-314.pyc and o/vllm/model_executor/layers/__pycache__/sparse_attn_indexer_kpool.cpython-314.pyc differ
+diff -ruN a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+--- a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py	2026-10-10 12:00:53.682078786 -0700
++++ b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py	2026-10-10 14:48:38.256497205 -0700
+@@ -70,6 +70,200 @@
+ _KPOOL_B12X_PAGED_PREFILL_MIN_POOLS = 65_536
+ 
+ 
++
++# GLMX probe 7/8: compare points inside the indexer (inert unless GLMX_KDA_PROBE=1).
++import os as _glmx_os
++
++_GLMX_PROBE = _glmx_os.environ.get("GLMX_KDA_PROBE") == "1"
++
++
++def _glmx_sync(tag):
++    from vllm.models.glm5next.nvidia.kda import glmx_sync_point
++
++    glmx_sync_point(tag)
++
++
++def _glmx_p2_log(score_rows, work_k, max_pool_len, logits, seq_lens, block_table, positions, num_decode_tokens, buf):
++    from vllm.models.glm5next.nvidia.kda import _glmx_step
++
++    if not _glmx_step.get("mixed"):
++        return
++    import logging
++    import torch as _t
++
++    _t.cuda.synchronize()
++    pos = positions[:score_rows].tolist() if positions is not None else None
++    logging.getLogger("vllm").warning(
++        "GLMX_PROBE p2 shapes: score_rows=%s num_decode_tokens=%s work_k=%s max_pool_len=%s "
++        "logits=%s stride=%s ptr=%s seq_lens=%s block_table=%s bt_max=%s positions=%s buf=%s buf_ptr=%s",
++        score_rows, num_decode_tokens, work_k, max_pool_len, tuple(logits.shape), tuple(logits.stride()),
++        logits.data_ptr(), seq_lens.tolist(), tuple(block_table.shape),
++        int(block_table.max().item()) if block_table.numel() else None, pos, tuple(buf.shape), buf.data_ptr(),
++    )
++
++
++def _glmx_p2_topk_log(pool_topk, seq_lens):
++    from vllm.models.glm5next.nvidia.kda import _glmx_step
++
++    if not _glmx_step.get("mixed"):
++        return
++    import logging
++    import torch as _t
++
++    _t.cuda.synchronize()
++    lo = int(pool_topk.min().item()); hi = int(pool_topk.max().item())
++    logging.getLogger("vllm").warning(
++        "GLMX_PROBE p2 pool_topk: shape=%s ptr=%s stream=%s min=%s max=%s seq_lens=%s row0_head=%s",
++        tuple(pool_topk.shape), pool_topk.data_ptr(), _t.cuda.current_stream().cuda_stream, lo, hi, seq_lens.tolist(), pool_topk[0, :8].tolist(),
++    )
++
++
++# GLMX probe 10: pad decode-path-2 pool_topk with a sentinel tail, check the
++# tail and the logits after persistent_topk, and dump the inputs on overrun.
++_GLMX_P10_PAD = 32768
++_GLMX_P10_SENTINEL = -7
++_glmx_p10 = {"dumps": 0, "calls": 0}
++
++
++# GLMX probe 11: on mixed steps, find where all-NaN decode logits come from.
++# Logs per-row NaN in logits next to NaN/inf/zero stats of the kernel inputs
++# (q fp8, weights, hidden_states, k, gate) and of the KPool pages and scales the
++# rows read. Dumps the inputs on the first NaN events.
++_glmx_p11_state = {"dumps": 0, "calls": 0, "clean_scans": 0}
++
++
++def _glmx_rowstats(t):
++    import torch as _t
++
++    f = t.reshape(t.shape[0], -1).float()
++    fin = _t.where(_t.isfinite(f), f.abs(), _t.zeros_like(f))
++    return [(int(_t.isnan(f[r]).sum()), int(_t.isinf(f[r]).sum()), float(fin[r].max()),
++             int((f[r] == 0).sum())) for r in range(f.shape[0])]
++
++
++def _glmx_p11(prefix, score_rows, logits, seq_lens, q_quant, weights, hidden_states, k, gate_score,
++              kv_cache_raw, block_table, num_decode_tokens, positions):
++    import logging
++    import os
++    import torch as _t
++    from vllm.models.glm5next.nvidia.kda import _glmx_step
++
++    if not _glmx_step.get("mixed"):
++        return
++    log = logging.getLogger("vllm")
++    _glmx_p11_state["calls"] += 1
++    lens = [int(x) for x in seq_lens.tolist()]
++    lnan = [int(_t.isnan(logits[r, :lens[r]]).sum()) for r in range(score_rows)]
++    q8 = q_quant[:score_rows].reshape(score_rows, -1).view(_t.uint8)
++    qnan = [int(((q8[r] & 0x7F) == 0x7F).sum()) for r in range(score_rows)]
++    qzero = [int(((q8[r] & 0x7F) == 0).sum()) for r in range(score_rows)]
++    w = _glmx_rowstats(weights[:score_rows])
++    hs = _glmx_rowstats(hidden_states[:score_rows])
++    kk = _glmx_rowstats(k[:score_rows]) if k is not None else None
++    gs = _glmx_rowstats(gate_score[:score_rows]) if gate_score is not None else None
++    pos = positions[:score_rows].tolist() if positions is not None else None
++    any_nan = any(lnan)
++    pages = None
++    if any_nan or _glmx_p11_state["clean_scans"] < 24:
++        if not any_nan:
++            _glmx_p11_state["clean_scans"] += 1
++        pages = []
++        n_blocks = kv_cache_raw.shape[0]
++        flat = kv_cache_raw.reshape(n_blocks, -1)
++        for r in range(score_rows):
++            npg = -(-lens[r] // 32)
++            ids = block_table[r, :npg].long()
++            bad_ids = int(((ids < 0) | (ids >= n_blocks)).sum())
++            ids = ids.clamp(0, n_blocks - 1)
++            pg = flat[ids]
++            sc = pg[:, 4096:4096 + 128].contiguous().view(_t.float32).reshape(-1)[:lens[r]]
++            kb = pg[:, :4096].reshape(-1)[:lens[r] * 128]
++            pages.append({"npg": npg, "bad_ids": bad_ids, "sc_nan": int(_t.isnan(sc).sum()),
++                          "sc_inf": int(_t.isinf(sc).sum()), "sc_zero": int((sc == 0).sum()),
++                          "sc_max": float(sc[_t.isfinite(sc)].abs().max()) if _t.isfinite(sc).any() else None,
++                          "k_nanbytes": int(((kb & 0x7F) == 0x7F).sum()),
++                          "last_page": int(block_table[r, npg - 1]), "last_sc": [float(x) for x in sc[-4:].tolist()]})
++    level = log.error if any_nan else log.warning
++    level("GLMX_PROBE p11 nan check: call=%d prefix=%s ndec=%d lens=%s pos=%s logits_nan=%s q_nan=%s q_zero=%s "
++          "w=%s hs=%s k=%s gate=%s pages=%s",
++          _glmx_p11_state["calls"], prefix, num_decode_tokens, lens, pos, lnan, qnan, qzero, w, hs, kk, gs, pages)
++    if any_nan and _glmx_p11_state["dumps"] < 2:
++        _glmx_p11_state["dumps"] += 1
++        path = "/cache/glmx-p11-%d-%d.pt" % (os.getpid(), _glmx_p11_state["dumps"])
++        _t.save({"prefix": prefix, "lens": lens, "positions": pos, "q_quant": q_quant[:score_rows].view(_t.uint8).cpu(),
++                 "weights": weights[:score_rows].cpu(), "hidden_states": hidden_states[:max(score_rows, num_decode_tokens) + 8].cpu(),
++                 "k": k[:score_rows].cpu() if k is not None else None,
++                 "gate_score": gate_score[:score_rows].cpu() if gate_score is not None else None,
++                 "block_table": block_table[:score_rows].cpu()}, path)
++        log.error("GLMX_PROBE p11 dumped %s", path)
++
++
++def _glmx_p10_alloc(score_rows, work_k, device):
++    import torch as _t
++
++    n = score_rows * work_k
++    flat = _t.full((n + _GLMX_P10_PAD,), _GLMX_P10_SENTINEL, dtype=_t.int32, device=device)
++    return flat, flat[:n].view(score_rows, work_k)
++
++
++def _glmx_p10_pre(logits):
++    from vllm.models.glm5next.nvidia.kda import _glmx_step
++
++    if not _glmx_step.get("mixed"):
++        return None
++    return logits.clone()
++
++
++def _glmx_bins(row):
++    import torch as _t
++
++    bits = row.to(_t.float16).view(_t.int16).to(_t.int32) & 0xFFFF
++    key = _t.where((bits & 0x8000) != 0, (~bits) & 0xFFFF, bits | 0x8000)
++    return key >> 8
++
++
++def _glmx_p10_post(flat, pool_topk, logits, saved, seq_lens, work_k, max_pool_len):
++    import logging
++    import os
++    import torch as _t
++
++    log = logging.getLogger("vllm")
++    _glmx_p10["calls"] += 1
++    if saved is None:
++        return
++    _t.cuda.synchronize()
++    n = pool_topk.numel()
++    tail = flat[n:]
++    bad = (tail != _GLMX_P10_SENTINEL).nonzero().reshape(-1)
++    changed = not _t.equal(saved, logits)
++    lens = seq_lens.tolist()
++    rows = []
++    for r, ln in enumerate(lens):
++        row = saved[r, :max(int(ln), 0)]
++        bins = _glmx_bins(row)
++        top = int(bins.max().item()) if row.numel() else -1
++        rows.append("r%d len=%d nan=%d inf=%d uniq=%d min=%.4g max=%.4g topbin=%d topbin_n=%d unwritten=%d ge_len=%d" % (
++            r, ln, int(_t.isnan(row).sum()), int(_t.isinf(row).sum()), int(_t.unique(row).numel()),
++            float(_t.nan_to_num(row).min()) if row.numel() else 0.0,
++            float(_t.nan_to_num(row).max()) if row.numel() else 0.0,
++            top, int((bins == top).sum()) if row.numel() else 0,
++            int((pool_topk[r] == _GLMX_P10_SENTINEL).sum()), int((pool_topk[r] >= ln).sum())))
++    level = log.error if bad.numel() or changed else log.warning
++    level("GLMX_PROBE p10 topk check: call=%d overrun=%d first=%s last=%s vals=%s logits_changed=%s "
++          "work_k=%d max_pool_len=%d flat_ptr=%d %s",
++          _glmx_p10["calls"], bad.numel(),
++          int(bad[0]) + n if bad.numel() else None, int(bad[-1]) + n if bad.numel() else None,
++          tail[bad[:12]].tolist() if bad.numel() else [], changed, work_k, max_pool_len,
++          flat.data_ptr(), " | ".join(rows))
++    if (bad.numel() or changed) and _glmx_p10["dumps"] < 3:
++        _glmx_p10["dumps"] += 1
++        path = "/cache/glmx-p10-%d-%d.pt" % (os.getpid(), _glmx_p10["dumps"])
++        _t.save({"logits_before": saved.cpu(), "logits_after": logits.cpu(), "seq_lens": seq_lens.cpu(),
++                 "work_k": work_k, "max_pool_len": max_pool_len, "flat": flat.cpu(),
++                 "score_rows": pool_topk.shape[0]}, path)
++        log.error("GLMX_PROBE p10 dumped %s", path)
++
++
+ def _can_use_b12x_kpool_prefill(
+     *,
+     use_b12x_sparse_indexer: bool,
+@@ -521,7 +715,11 @@
+                 scale_fmt,
+             )
+ 
++    if _GLMX_PROBE:
++        _glmx_sync("IDX cache-insert")
+     topk_indices_buffer[: hidden_states.shape[0]] = -1
++    if _GLMX_PROBE:
++        _glmx_sync("IDX fill -1")
+     if has_prefill:
+         prefill_metadata = attn_metadata_narrowed.prefill
+         assert prefill_metadata is not None
+@@ -623,6 +821,8 @@
+                     topk_tokens=select_k,
+                     shared_page_table=True,
+                 )
++                if _GLMX_PROBE:
++                    _glmx_sync("IDX prefill b12x topk")
+                 if positions is not None:
+                     q_seq = (
+                         positions[chunk.token_start : chunk.token_end].to(torch.int32)
+@@ -730,6 +930,8 @@
+                     logits.stride(1),
+                     work_k,
+                 )
++                if _GLMX_PROBE:
++                    _glmx_sync("IDX prefill top_k_per_row")
+ 
+             if index_kpool > 1:
+                 _merge_kpool_dcp_topk(
+@@ -741,6 +943,8 @@
+                     dcp_rank=dcp_rank,
+                     cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                 )
++                if _GLMX_PROBE:
++                    _glmx_sync("IDX prefill dcp merge")
+                 pool_ids = pool_topk[:, :select_k].to(torch.int64)
+                 if positions is not None:
+                     # Fused expand-pools + append-tail into one Triton kernel
+@@ -766,6 +970,8 @@
+                         chunk.token_start : chunk.token_end, : expanded.shape[-1]
+                     ] = expanded
+ 
++    if _GLMX_PROBE:
++        _glmx_sync("IDX prefill")
+     if has_decode:
+         decode_metadata = attn_metadata_narrowed.decode
+         assert decode_metadata is not None
+@@ -895,6 +1101,8 @@
+                     head_dim,
+                     round_scale=(scale_fmt is not None),
+                 )
++        if _GLMX_PROBE:
++            _glmx_sync("IDX decode cache-update")
+         use_b12x_indexer = (
+             use_b12x_sparse_indexer_fn(use_b12x_sparse_indexer)
+             and int(kv_cache_raw.shape[1]) == 64
+@@ -986,6 +1194,8 @@
+                     index_kpool,
+                     out=topk_indices_buffer[:score_rows],
+                 )
++            if _GLMX_PROBE:
++                _glmx_sync("IDX decode path 1")
+             return topk_indices_buffer
+ 
+         if use_kpool32_indexer:
+@@ -1016,16 +1226,27 @@
+                 pool_block_table,
+                 max_pool_len,
+             )
+-            pool_topk = torch.empty(
+-                (score_rows, work_k),
+-                dtype=torch.int32,
+-                device=logits.device,
+-            )
++            if _GLMX_PROBE:
++                _glmx_sync("IDX p2 logits")
++            if _GLMX_PROBE:
++                _glmx_p2_log(score_rows, work_k, max_pool_len, logits, pool_seq_lens, pool_block_table, positions, num_decode_tokens, topk_indices_buffer)
++            if _GLMX_PROBE:
++                _glmx_p11(k_cache_prefix, score_rows, logits, pool_seq_lens, q_quant, weights, hidden_states, k, gate_score,
++                          kv_cache_raw, pool_block_table, num_decode_tokens, positions)
++            if _GLMX_PROBE:
++                _glmx_flat, pool_topk = _glmx_p10_alloc(score_rows, work_k, logits.device)
++            else:
++                pool_topk = torch.empty(
++                    (score_rows, work_k),
++                    dtype=torch.int32,
++                    device=logits.device,
++                )
+             if work_k in (512, 1024, 2048):
+                 workspace_manager = current_workspace_manager()
+                 (topk_workspace,) = workspace_manager.get_simultaneous(
+                     ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                 )
++                _glmx_saved = _glmx_p10_pre(logits) if _GLMX_PROBE else None
+                 torch.ops._C.persistent_topk(
+                     logits,
+                     pool_seq_lens,
+@@ -1034,6 +1255,9 @@
+                     work_k,
+                     max_pool_len,
+                 )
++                if _GLMX_PROBE:
++                    _glmx_p10_post(_glmx_flat, pool_topk, logits, _glmx_saved, pool_seq_lens, work_k, max_pool_len)
++                    _glmx_sync("IDX p2 persistent_topk")
+             else:
+                 torch.ops._C.top_k_per_row_decode(
+                     logits,
+@@ -1045,6 +1269,8 @@
+                     logits.stride(1),
+                     work_k,
+                 )
++                if _GLMX_PROBE:
++                    _glmx_sync("IDX p2 top_k_per_row_decode")
+             _merge_kpool_dcp_topk(
+                 logits=logits,
+                 pool_topk=pool_topk,
+@@ -1054,6 +1280,10 @@
+                 dcp_rank=dcp_rank,
+                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+             )
++            if _GLMX_PROBE:
++                _glmx_sync("IDX p2 dcp merge")
++            if _GLMX_PROBE:
++                _glmx_p2_topk_log(pool_topk, pool_seq_lens)
+             if positions is not None:
+                 dec_seq = positions[:score_rows].to(torch.int32) + 1
+             else:
+@@ -1065,6 +1295,8 @@
+                 index_kpool,
+                 out=topk_indices_buffer[:score_rows],
+             )
++            if _GLMX_PROBE:
++                _glmx_sync("IDX decode path 2")
+             return topk_indices_buffer
+ 
+         schedule_metadata = decode_metadata.schedule_metadata
+@@ -1227,6 +1459,8 @@
+             )
+         if decode_metadata.requires_padding or index_kpool == 1:
+             topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
++        if _GLMX_PROBE:
++            _glmx_sync("IDX decode path 3")
+ 
+     return topk_indices_buffer
+ 
+diff -ruN a/vllm/models/glm5next/nvidia/kda.py b/vllm/models/glm5next/nvidia/kda.py
+--- a/vllm/models/glm5next/nvidia/kda.py	2026-10-10 09:52:27.857884605 -0700
++++ b/vllm/models/glm5next/nvidia/kda.py	2026-10-10 15:17:30.015622436 -0700
+@@ -43,6 +43,283 @@
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+ 
+ 
++# --- glm-xid31 probe (debug only; inert unless GLMX_KDA_PROBE=1) ---
++import os as _glmx_os
++
++from vllm.logger import init_logger as _glmx_init_logger
++
++_glmx_log = _glmx_init_logger("vllm.glmx_probe")
++_GLMX_PROBE = _glmx_os.environ.get("GLMX_KDA_PROBE") == "1"
++_glmx_checks = {"mixed": 0, "prefill": 0}
++
++
++def _glmx_head(values, n=12):
++    return values if len(values) <= 2 * n else values[:n] + ["..."] + values[-n:]
++
++
++def _glmx_probe_prefill(prefix, q_ns, cu, state_idx, has_init, recurrent_state,
++                        use_spec, spec_cu, spec_idx, q_spec, num_spec_decodes,
++                        non_spec_token_indx, spec_token_indx, num_actual_tokens):
++    """Check that the device-side metadata agrees with the tensors the chunk
++    kernel will size its buffers from. Syncs the device; debug only."""
++    cu_l = [int(x) for x in cu.tolist()]
++    idx = [int(x) for x in state_idx.reshape(-1).tolist()]
++    t = int(q_ns.shape[0])
++    slots = int(recurrent_state.shape[0])
++    problems = []
++    if not cu_l or cu_l[0] != 0 or any(b < a for a, b in zip(cu_l, cu_l[1:])):
++        problems.append("non_spec cu_seqlens not monotone from 0")
++    if cu_l and cu_l[-1] != t:
++        problems.append(f"non_spec cu_seqlens[-1]={cu_l[-1]} != q_ns tokens={t}")
++    if len(cu_l) - 1 != len(idx):
++        problems.append(f"non_spec seqs={len(cu_l) - 1} != state rows={len(idx)}")
++    if int(has_init.numel()) != len(idx):
++        problems.append(f"has_initial_state={int(has_init.numel())} != state rows={len(idx)}")
++    bad = [i for i in idx if not 0 <= i < slots]
++    if bad:
++        problems.append(f"non_spec state ids out of [0,{slots}): {_glmx_head(bad)}")
++    detail = {"layer": prefix, "num_actual_tokens": int(num_actual_tokens),
++              "q_ns_tokens": t, "non_spec_cu": _glmx_head(cu_l),
++              "non_spec_state_ids": _glmx_head(idx), "state_slots": slots}
++    if use_spec:
++        scu = [int(x) for x in spec_cu.tolist()]
++        sidx = spec_idx.tolist()
++        ts = int(q_spec.shape[0]) if q_spec is not None else -1
++        detail.update(spec_cu=scu, spec_state_ids=sidx, q_spec_tokens=ts,
++                      num_spec_decodes=int(num_spec_decodes))
++        if scu[-1] != ts:
++            problems.append(f"spec cu_seqlens[-1]={scu[-1]} != q_spec tokens={ts}")
++        if len(scu) - 1 != int(num_spec_decodes):
++            problems.append(f"spec seqs={len(scu) - 1} != num_spec_decodes={int(num_spec_decodes)}")
++        flat = [int(v) for row in sidx for v in (row if isinstance(row, list) else [row])]
++        over = [v for v in flat if v >= slots]
++        if over:
++            problems.append(f"spec state ids >= {slots}: {_glmx_head(over)}")
++        if any(v < 0 for v in flat):
++            detail["spec_negative_ids"] = sum(v < 0 for v in flat)
++    if non_spec_token_indx is not None and spec_token_indx is not None:
++        ns_n, sp_n = int(non_spec_token_indx.numel()), int(spec_token_indx.numel())
++        detail.update(non_spec_token_indx_n=ns_n, spec_token_indx_n=sp_n)
++        if ns_n + sp_n != int(num_actual_tokens):
++            problems.append(f"token split {ns_n}+{sp_n} != num_actual_tokens={int(num_actual_tokens)}")
++    key = "mixed" if use_spec else "prefill"
++    _glmx_checks[key] += 1
++    if problems:
++        _glmx_log.error("GLMX_PROBE violation %s: %s", problems, detail)
++        raise RuntimeError(f"GLMX probe: KDA prefill metadata inconsistent: {problems}")
++    if prefix.endswith(".0.self_attn") or _glmx_checks[key] <= 3 or _glmx_checks[key] % 500 == 0:
++        if _glmx_checks[key] <= 3 or _glmx_checks[key] % 500 == 0:
++            _glmx_log.warning("GLMX_PROBE ok %s #%d %s", key, _glmx_checks[key], detail)
++
++
++def _glmx_list(t):
++    return None if t is None else [int(x) for x in t.reshape(-1).tolist()]
++
++
++def _glmx_probe_entry(prefix, md, num_actual_tokens, rows, num_spec):
++    """Mixed spec+prefill steps only: sync at KDA layer entry so an earlier
++    asynchronous error surfaces tagged with this layer, then check the token
++    split and spec metadata values before any index_select runs."""
++    import torch
++    try:
++        torch.cuda.synchronize()
++    except Exception as error:
++        _glmx_log.error("GLMX_PROBE async error surfaced at ENTRY of %s: %s", prefix, error)
++        raise
++    n = int(num_actual_tokens)
++    spec = _glmx_list(md.spec_token_indx) or []
++    non = _glmx_list(md.non_spec_token_indx) or []
++    acc = _glmx_list(md.num_accepted_tokens)
++    detail = {"layer": prefix, "num_actual_tokens": n, "rows": int(rows),
++              "num_prefills": int(md.num_prefills), "num_decodes": int(md.num_decodes),
++              "num_spec_decodes": int(md.num_spec_decodes),
++              "spec_token_indx": _glmx_head(spec), "non_spec_token_indx": _glmx_head(non),
++              "spec_cu": _glmx_list(md.spec_query_start_loc),
++              "non_spec_cu": _glmx_head(_glmx_list(md.non_spec_query_start_loc) or []),
++              "spec_state_ids": md.spec_state_indices_tensor.tolist() if md.spec_state_indices_tensor is not None else None,
++              "non_spec_state_ids": _glmx_list(md.non_spec_state_indices_tensor),
++              "num_accepted_tokens": acc,
++              "spec_sequence_masks": _glmx_list(md.spec_sequence_masks),
++              "has_initial_state": _glmx_list(md.has_initial_state),
++              "md_id": id(md),
++              "stream": torch.cuda.current_stream().cuda_stream,
++              "ptrs": {name: (getattr(md, name).data_ptr() if getattr(md, name) is not None else None)
++                       for name in ("spec_state_indices_tensor", "spec_sequence_masks",
++                                    "num_accepted_tokens", "spec_token_indx",
++                                    "non_spec_token_indx", "spec_query_start_loc",
++                                    "non_spec_state_indices_tensor")}}
++    problems = []
++    every = spec + non
++    if any(not 0 <= i < n for i in every):
++        problems.append(f"token index outside [0,{n}): {_glmx_head([i for i in every if not 0 <= i < n])}")
++    if len(set(every)) != len(every):
++        problems.append("spec and non-spec token indices overlap or repeat")
++    if len(every) != n:
++        problems.append(f"token split {len(spec)}+{len(non)} != num_actual_tokens={n}")
++    if int(rows) < n:
++        problems.append(f"projection rows={int(rows)} < num_actual_tokens={n}")
++    if acc is not None and any(not 1 <= a <= num_spec + 1 for a in acc):
++        problems.append(f"num_accepted_tokens outside [1,{num_spec + 1}]: {acc}")
++    if problems:
++        _glmx_log.error("GLMX_PROBE entry violation %s: %s", problems, detail)
++        raise RuntimeError(f"GLMX probe: KDA entry metadata inconsistent: {problems}")
++    # Probe 4: log every KDA layer of a mixed step, with object identity and
++    # tensor pointers, to tell per-group metadata from in-flight overwrites.
++    _glmx_log.warning("GLMX_PROBE mixed-step %s", detail)
++    if prefix.endswith(".0.self_attn"):
++        _glmx_snapshot_metadata(prefix)
++
++
++_glmx_step = {"mixed": False}
++
++
++# Probe 12: NaN origin in KDA layers 0-2 (spec-verify path).
++_glmx_p12 = {"mixed_logs": 0, "other_logs": 0}
++_GLMX_P12_LAYERS = (".layers.0.", ".layers.1.", ".layers.2.")
++
++
++def _glmx_p12_rows(x, n):
++    """NaN count per leading row of x (first n rows), as a list."""
++    import torch as _t
++    if x is None or n == 0:
++        return None
++    n = min(n, x.shape[0])
++    return _t.isnan(x[:n].reshape(n, -1).float()).sum(-1).tolist()
++
++
++def _glmx_p12_state(state, idx):
++    import torch as _t
++    if idx is None:
++        return None
++    flat = idx.reshape(-1).long()
++    ok = (flat >= 0) & (flat < state.shape[0])
++    out = _t.full((flat.numel(),), -1, dtype=_t.long, device=flat.device)
++    if bool(ok.any()):
++        sel = state[flat[ok]]
++        out[ok] = _t.isnan(sel.reshape(sel.shape[0], -1).float()).sum(-1)
++    return out.reshape(idx.shape).tolist()
++# Probe 5: copies of every GDN metadata tensor, taken at layer 0's KDA entry
++# of a mixed step once the checks above passed. Keyed (id(md), field).
++_glmx_snap = {"tensors": {}, "layers": {}, "changed": set()}
++
++
++
++# Probe 9: CUDA caching-allocator history. Started at the first mixed-step
++# snapshot; on a metadata change, dump the alloc/free events (with Python
++# stacks) of the block holding the changed tensor.
++_glmx_hist = {"on": False}
++
++
++def _glmx_start_history():
++    import torch
++    if _glmx_hist["on"]:
++        return
++    torch.cuda.memory._record_memory_history(
++        enabled="all", context="all", stacks="python", max_entries=400000)
++    _glmx_hist["on"] = True
++    _glmx_log.warning("GLMX_PROBE memory history recording started")
++
++
++def _glmx_frames(entry, n=7):
++    out = []
++    for fr in entry.get("frames") or []:
++        fn = fr.get("filename", "")
++        if "/torch/" in fn or fn.startswith("<") or "glmx" in fr.get("name", ""):
++            continue
++        out.append("%s:%s:%s" % (fn.split("/vllm/")[-1], fr.get("line"), fr.get("name")))
++        if len(out) >= n:
++            break
++    return out
++
++
++def _glmx_trace_block(tag, field, ptr):
++    import torch
++    try:
++        snap = torch.cuda.memory._snapshot()
++    except Exception as error:
++        _glmx_log.error("GLMX_PROBE trace failed: %s", error)
++        return
++    dev = torch.cuda.current_device()
++    for seg in snap.get("segments", []):
++        base = seg["address"]
++        if not (base <= ptr < base + seg["total_size"]):
++            continue
++        for blk in seg.get("blocks", []):
++            if blk["address"] <= ptr < blk["address"] + blk["size"]:
++                _glmx_log.error(
++                    "GLMX_PROBE block for %s after %s: ptr=%d block=%d size=%d requested=%s "
++                    "state=%s seg_stream=%s seg_pool=%s frames=%s",
++                    field, tag, ptr, blk["address"], blk["size"], blk.get("requested_size"),
++                    blk.get("state"), seg.get("stream"), seg.get("segment_pool_id"),
++                    _glmx_frames(blk))
++    traces = snap.get("device_traces", [])
++    events = traces[dev] if dev < len(traces) else []
++    hits = [e for e in events if e.get("addr") is not None
++            and e["addr"] <= ptr < e["addr"] + max(int(e.get("size") or 0), 1)]
++    _glmx_log.error("GLMX_PROBE history for %s ptr=%d: %d events (of %d)",
++                    field, ptr, len(hits), len(events))
++    for e in hits[-10:]:
++        _glmx_log.error(
++            "GLMX_PROBE   event %s addr=%d size=%s stream=%s frames=%s",
++            e.get("action"), e["addr"], e.get("size"), e.get("stream"), _glmx_frames(e))
++
++def _glmx_snapshot_metadata(prefix):
++    import dataclasses
++    import torch
++    snap = {}
++    layers = {}
++    for name, md in get_forward_context().attn_metadata.items():
++        if not isinstance(md, GDNAttentionMetadata):
++            continue
++        layers.setdefault(id(md), []).append(name.split(".")[-2])
++        for field in dataclasses.fields(md):
++            value = getattr(md, field.name)
++            if isinstance(value, torch.Tensor) and value.is_cuda and value.numel() <= (1 << 20):
++                snap[(id(md), field.name)] = (value, value.clone())
++    torch.cuda.synchronize()
++    _glmx_start_history()
++    _glmx_snap.update(tensors=snap, layers=layers, changed=set(), traced=0)
++    _glmx_log.warning("GLMX_PROBE snapshot at %s: %d tensors in %d metadata objects",
++                      prefix, len(snap), len(layers))
++
++
++def _glmx_compare_metadata(tag):
++    import torch
++    if tag == "L0 pre-attention":
++        # A new forward: the snapshot belonged to the previous step.
++        _glmx_snap.update(tensors={}, layers={}, changed=set())
++        return
++    for key, (live, saved) in _glmx_snap["tensors"].items():
++        if key in _glmx_snap["changed"] or torch.equal(live, saved):
++            continue
++        _glmx_snap["changed"].add(key)
++        if _glmx_snap.get("traced", 0) < 3:
++            _glmx_snap["traced"] = _glmx_snap.get("traced", 0) + 1
++            _glmx_trace_block(tag, key[1], live.data_ptr())
++        diff = (live.reshape(-1) != saved.reshape(-1)).nonzero().reshape(-1)
++        _glmx_log.error(
++            "GLMX_PROBE metadata CHANGED after %s: field=%s md_layers=%s ptr=%d "
++            "numel=%d changed_elems=%d first_idx=%s saved=%s now=%s",
++            tag, key[1], _glmx_snap["layers"].get(key[0]), live.data_ptr(), live.numel(),
++            diff.numel(), _glmx_head(diff.tolist(), 6),
++            _glmx_head(saved.reshape(-1)[diff[:6]].tolist(), 6),
++            _glmx_head(live.reshape(-1)[diff[:6]].tolist(), 6))
++
++
++def glmx_sync_point(tag):
++    """Probe 3: on mixed spec+prefill steps, sync and tag any asynchronous
++    CUDA error with the sub-block that just ran (layer attention or MLP)."""
++    if not (_GLMX_PROBE and _glmx_step["mixed"]):
++        return
++    import torch
++    try:
++        torch.cuda.synchronize()
++    except Exception as error:
++        _glmx_log.error("GLMX_PROBE async error surfaced AFTER %s: %s", tag, error)
++        raise
++    _glmx_compare_metadata(tag)
++
++
+ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
+     """Merged projection with multiple replicated output shards.
+ 
+@@ -382,6 +659,15 @@
+         num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
+         num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
+         use_spec = spec_sequence_masks is not None and num_spec_decodes > 0
++        if _GLMX_PROBE and ".layers.0." in self.prefix:
++            _glmx_step["mixed"] = bool(use_spec and attn_metadata_narrowed.num_prefills > 0)
++        if _GLMX_PROBE and use_spec and attn_metadata_narrowed.num_prefills > 0:
++            _glmx_probe_entry(
++                self.prefix, attn_metadata_narrowed, num_actual_tokens,
++                qkv_proj_states.shape[0],
++                spec_state_indices_tensor.shape[-1] - 1
++                if spec_state_indices_tensor is not None else 0,
++            )
+         # Safe-gate checkpoints use the bounded sigmoid variant.
+         safe_gate = self.kda_safe_gate
+         lower_bound = self.kda_lower_bound
+@@ -447,6 +733,41 @@
+             qkv_spec = g1_spec = beta_spec = None
+             qkv_ns, g1_ns, beta_ns = qkv_proj_states, g1, beta
+ 
++        glmx_sync_point(f"{self.prefix} after token index_select")
++        _p12 = None
++        if (_GLMX_PROBE and use_spec and any(s in self.prefix for s in _GLMX_P12_LAYERS)
++                and not __import__("torch").cuda.is_current_stream_capturing()):
++            _mixed = attn_metadata_narrowed.num_prefills > 0
++            _p12 = {"mixed": _mixed}
++            _nsp = spec_state_indices_tensor.shape[-1]
++            _ntok = num_spec_decodes * _nsp
++            _p12["acc"] = num_accepted_tokens[:num_spec_decodes].tolist()
++            _p12["slots"] = spec_state_indices_tensor[:num_spec_decodes].tolist()
++            _p12["qkv_in"] = _glmx_p12_rows(qkv_spec, _ntok)
++            # The slot the recurrent kernel reads its initial state from:
++            # flat index i * stride + num_accepted_tokens[i] - 1, unchecked
++            # in fused_recurrent.py:115-126 (out-of-row when acc > columns).
++            _flat = spec_state_indices_tensor.reshape(-1)
++            _st = spec_state_indices_tensor.stride(0)
++            _read = []
++            for _i, _a in enumerate(_p12["acc"]):
++                _j = _i * _st + int(_a) - 1
++                _read.append((_j, int(_flat[_j]) if 0 <= _j < _flat.numel() else "OOB"))
++            _p12["read_slot"] = _read
++            _p12["read_slot_nan"] = [
++                _glmx_p12_state(recurrent_state, __import__("torch").tensor([s], device=recurrent_state.device))[0]
++                if isinstance(s, int) else None for _, s in _read]
++            if _mixed:
++                # Prefill side of the same step: its state slots and overlap.
++                _ns = non_spec_state_indices_tensor
++                _p12["prefill_slots"] = _ns.tolist() if _ns is not None else None
++                _p12["prefill_has_init"] = has_initial_state.tolist() if has_initial_state is not None else None
++                _sp = set(int(x) for x in spec_state_indices_tensor[:num_spec_decodes].reshape(-1).tolist())
++                _p12["overlap"] = sorted(_sp & set(_p12["prefill_slots"] or []))
++                _p12["adjacent"] = sorted(s for s in (_p12["prefill_slots"] or [])
++                                          if (s - 1) in _sp or (s + 1) in _sp)
++                _p12["conv_pre"] = _glmx_p12_state(conv_state, spec_state_indices_tensor[:num_spec_decodes, 0])
++                _p12["state_pre"] = _glmx_p12_state(recurrent_state, spec_state_indices_tensor[:num_spec_decodes])
+         # --- causal conv1d: spec (draft-verify) path ---
+         if use_spec:
+             assert spec_state_indices_tensor is not None
+@@ -465,6 +786,9 @@
+                 max_query_len=conv_mql,
+             )
+             q_spec, k_spec, v_spec = qkv_spec.split(self.local_projection_size, dim=-1)
++            glmx_sync_point(f"{self.prefix} after spec conv1d_update")
++            if _p12 is not None:
++                _p12["qkv_conv"] = _glmx_p12_rows(qkv_spec, _ntok)
+ 
+         # --- causal conv1d: non-spec path (prefill or plain decode) ---
+         q_ns = k_ns = v_ns = None
+@@ -500,6 +824,7 @@
+         def _rearr(x):
+             return x.reshape(1, -1, self.local_num_heads, self.head_dim)
+ 
++        glmx_sync_point(f"{self.prefix} after non-spec conv1d")
+         # --- core attention: spec (draft-verify) path ---
+         core_attn_out_spec = None
+         # In a pure spec-verify step (no non-spec tokens) the recurrent kernel
+@@ -537,6 +862,13 @@
+                 lower_bound=lower_bound,
+             )
+ 
++        glmx_sync_point(f"{self.prefix} after spec fused_recurrent_kda")
++        if _p12 is not None:
++            _out = core_attn_out_spec if core_attn_out_spec is not None else spec_out
++            _p12["out"] = _glmx_p12_rows(_out[0], _ntok)
++            _bad = any(_p12["out"] or []) or any(_p12["qkv_in"] or [])
++            if _p12["mixed"] or _bad:
++                _p12["state_post"] = _glmx_p12_state(recurrent_state, spec_state_indices_tensor[:num_spec_decodes])
+         # --- core attention: non-spec path (prefill or plain decode) ---
+         core_attn_out_non_spec = None
+         # Only the plain-decode recurrent kernel can write straight into the
+@@ -547,6 +879,15 @@
+             assert q_ns is not None
+             assert non_spec_state_indices_tensor is not None
+             assert has_initial_state is not None
++            if _GLMX_PROBE:
++                _glmx_probe_prefill(
++                    self.prefix, q_ns, non_spec_query_start_loc,
++                    non_spec_state_indices_tensor, has_initial_state,
++                    recurrent_state, use_spec, spec_query_start_loc,
++                    spec_state_indices_tensor,
++                    q_spec if use_spec else None, num_spec_decodes,
++                    non_spec_token_indx, spec_token_indx, num_actual_tokens,
++                )
+             initial_state = gather_initial_states(
+                 recurrent_state, non_spec_state_indices_tensor, has_initial_state
+             )
+@@ -576,6 +917,9 @@
+                 last_recurrent_state,
+                 non_spec_state_indices_tensor,
+             )
++            glmx_sync_point(f"{self.prefix} after chunk prefill + scatter_states")
++            if _p12 is not None:
++                _p12["prefill_out_nan"] = int(__import__("torch").isnan(core_attn_out_non_spec.float()).sum().item())
+         elif attn_metadata_narrowed.num_decodes > 0:
+             assert non_spec_query_start_loc is not None
+             assert non_spec_state_indices_tensor is not None
+@@ -605,6 +949,12 @@
+                 lower_bound=lower_bound,
+             )
+ 
++        if _p12 is not None:
++            _key = "mixed_logs" if _p12["mixed"] else "other_logs"
++            _bad = any(_p12.get("out") or []) or any(_p12.get("qkv_in") or [])
++            if (_p12["mixed"] and _glmx_p12[_key] < 3000) or (_bad and _glmx_p12[_key] < 60):
++                _glmx_p12[_key] += 1
++                _glmx_log.warning("GLMX_PROBE p12 kda %s #%d %s", self.prefix, _glmx_p12[_key], _p12)
+         # --- merge spec / non-spec outputs back into token order ---
+         if use_spec and core_attn_out_non_spec is not None:
+             assert core_attn_out_spec is not None
+diff -ruN a/vllm/models/glm5next/nvidia/model.py b/vllm/models/glm5next/nvidia/model.py
+--- a/vllm/models/glm5next/nvidia/model.py	2026-10-10 09:52:27.857242388 -0700
++++ b/vllm/models/glm5next/nvidia/model.py	2026-10-10 10:24:50.883414494 -0700
+@@ -87,7 +87,7 @@
+ from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
+ 
+ from .attention import Glm5NextMLAAttention
+-from .kda import Glm5NextLinearAttention
++from .kda import Glm5NextLinearAttention, glmx_sync_point
+ from .multimodal import (
+     Glm5NextMultiModalProcessor,
+     Glm5NextProcessingInfo,
+@@ -475,10 +475,12 @@
+         if self.is_sequence_parallel:
+             x = sp_all_gather(x)[: positions.shape[0]]
+ 
++        glmx_sync_point(f"L{self.layer_idx} pre-attention")
+         x = self.self_attn(
+             hidden_states=x,
+             positions=positions,
+         )
++        glmx_sync_point(f"L{self.layer_idx} attention")
+ 
+         if self.is_sequence_parallel:
+             x = sp_reduce_scatter(x)
+@@ -501,6 +503,7 @@
+             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
+         else:
+             x = self.mlp(x)
++        glmx_sync_point(f"L{self.layer_idx} mlp")
+ 
+         # mHC end. The last mHC layer materializes its final hc_post (nothing
+         # to fuse with) then contracts; every other layer defers its hc_post to
+Binary files a3/vllm/models/glm5next/nvidia/__pycache__/kda.cpython-314.pyc and o/vllm/models/glm5next/nvidia/__pycache__/kda.cpython-314.pyc differ
+Binary files a3/vllm/models/glm5next/nvidia/__pycache__/model.cpython-314.pyc and o/vllm/models/glm5next/nvidia/__pycache__/model.cpython-314.pyc differ
+diff -ruN a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+--- a/vllm/v1/attention/backends/gdn_attn.py	2026-10-10 15:23:04.742789425 -0700
++++ b/vllm/v1/attention/backends/gdn_attn.py	2026-10-10 15:53:54.881314099 -0700
+@@ -79,6 +79,46 @@
+     token_chunk_offset_ptr: torch.Tensor | None = None
+ 
+ 
++# --- glm-xid31 probe 12b (debug only; inert unless GLMX_KDA_PROBE=1) ---
++import os as _glmx_os
++
++_GLMX_P12B = {"on": _glmx_os.environ.get("GLMX_KDA_PROBE") == "1", "logs": 0, "meta": 0}
++
++
++def _glmx_p12b_log(m, selected, spec):
++    import logging
++
++    import torch as _t
++
++    if _t.cuda.is_current_stream_capturing() or _GLMX_P12B["logs"] >= 3000:
++        return
++    qs = m.query_start_loc_cpu
++    qlens = (qs[1:] - qs[:-1]).tolist()
++    if not (any(q > 4 for q in qlens) and any(2 <= q <= 4 for q in qlens)):
++        return
++    log = logging.getLogger("vllm")
++    bs = spec.block_size
++    if _GLMX_P12B["meta"] < 2:
++        _GLMX_P12B["meta"] += 1
++        log.warning("GLMX_PROBE p12b meta mamba_block_size=%d num_speculative_blocks=%s "
++                    "block_table_shape=%s stride=%s storage_int32=%d spec=%r", bs,
++                    getattr(spec, "num_speculative_blocks", None),
++                    tuple(m.block_table_tensor.shape), tuple(m.block_table_tensor.stride()),
++                    m.block_table_tensor.untyped_storage().nbytes() // 4, spec)
++    _GLMX_P12B["logs"] += 1
++    seq = m.seq_lens.tolist()
++    rows = []
++    for i, q in enumerate(qlens):
++        s = int(seq[i])
++        start = max((s - 1) // bs, 0)
++        lo = max(start - 2, 0)
++        raw = m.block_table_tensor[i, lo:start + 6].tolist()
++        nz = int((m.block_table_tensor[i] != 0).sum())
++        rows.append({"q": q, "seq": s, "start": start, "raw_from": lo, "raw": raw, "nonzero": nz,
++                     "sel": selected[i].tolist()})
++    log.warning("GLMX_PROBE p12b gdn #%d %s", _GLMX_P12B["logs"], rows)
++
++
+ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
+     kv_cache_spec: MambaSpec
+     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+@@ -194,6 +234,8 @@
+             self.vllm_config.cache_config.mamba_cache_mode,
+             output=self.block_table_tensor,
+         )
++        if _GLMX_P12B["on"]:
++            _glmx_p12b_log(m, block_table_tensor, self.kv_cache_spec)
+ 
+         spec_sequence_masks_cpu: torch.Tensor | None = None
+         non_spec_active_mask_cpu: torch.Tensor | None = None
+Binary files a3/vllm/v1/attention/backends/__pycache__/gdn_attn.cpython-314.pyc and o/vllm/v1/attention/backends/__pycache__/gdn_attn.cpython-314.pyc differ
+diff -ruN a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-08-27 18:11:42.000000000 -0700
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-10-10 16:04:45.493583421 -0700
+@@ -600,8 +600,15 @@
+             # every rank instead.
+             group_cp_size = get_kv_cache_dcp_shard_count(spec, self.dcp_size)
+             group_cp_sizes.append(group_cp_size)
++            # glm-xid31 origin fix: Mamba state is replicated across DCP ranks
++            # and its blocks are position-indexed over the full sequence
++            # (align mode), so its block-table width must not be CP-scaled.
++            # With DCP=2 the scaled width was cdiv(max_len, 2 * block_size) + spec
++            # blocks, too narrow for start + num_speculative_blocks near
++            # max_len / 2, and the align-mode state selection read past the row.
++            width_cp_size = 1 if isinstance(spec, MambaSpec) else group_cp_size
+             max_num_blocks = cdiv(
+-                block_table_max_model_len, spec.block_size * group_cp_size
++                block_table_max_model_len, spec.block_size * width_cp_size
+             )
+             # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
+             if isinstance(spec, MambaSpec):
